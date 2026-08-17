@@ -89,11 +89,49 @@ cargo build --release --locked
 cargo test --locked
 ```
 
-Run it as root with one absolute, root-owned profile path:
+Install the privileged boundary in one root-owned directory:
 
 ```sh
-sudo ./target/release/usb-gadget-supervisor \
-  --profile /etc/usb-gadget-supervisor/profiles/virtual-yubikey.toml
+sudo install -d -o root -g root -m 0755 \
+  /opt/usb-gadget-supervisor/profiles
+sudo install -o root -g root -m 0755 \
+  target/release/usb-gadget-supervisor \
+  /opt/usb-gadget-supervisor/usb-gadget-supervisor
+sudo install -o root -g root -m 0644 \
+  systemd/usb-gadget-supervisor@.service \
+  /opt/usb-gadget-supervisor/usb-gadget-supervisor@.service
+sudo systemctl link \
+  /opt/usb-gadget-supervisor/usb-gadget-supervisor@.service
+sudo systemctl daemon-reload
+```
+
+This is the only special installation directory. The systemd link under
+`/etc/systemd/system` contains no second copy. Each device repository builds
+its unprivileged worker in place and installs only its root-owned profile into
+`/opt/usb-gadget-supervisor/profiles`. Runtime mounts and persistent state stay
+under `/run`, `/dev`, and `/var/lib`; they are data, not installed program
+copies.
+
+For example, after cloning and building `virtual-trezor`, its installation is:
+
+```sh
+sudo install -o root -g root -m 0644 \
+  profiles/virtual-trezor.toml \
+  /opt/usb-gadget-supervisor/profiles/virtual-trezor.toml
+sudo systemctl enable --now \
+  usb-gadget-supervisor@virtual-trezor.service
+```
+
+The profile points directly to the worker in that clone's build directory.
+Updating the worker is therefore `git pull`, rebuild, and restart. Only profile
+changes require reinstalling the profile. Since one UDC can expose only one
+identity, stop the currently active profile before starting another one.
+
+The same profile can be run manually after stopping its service:
+
+```sh
+sudo /opt/usb-gadget-supervisor/usb-gadget-supervisor \
+  --profile /opt/usb-gadget-supervisor/profiles/virtual-yubikey.toml
 ```
 
 An optional `--udc NAME` selects a controller instead of the first available
@@ -102,7 +140,8 @@ entry in `/sys/class/udc`.
 Profiles can be schema-checked without root or USB hardware:
 
 ```sh
-usb-gadget-supervisor --check-profile --profile /absolute/path/to/profile.toml
+/opt/usb-gadget-supervisor/usb-gadget-supervisor \
+  --check-profile --profile /absolute/path/to/profile.toml
 ```
 
 The selected worker receives a private `AF_UNIX/SOCK_SEQPACKET` control socket,

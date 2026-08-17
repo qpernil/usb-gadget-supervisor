@@ -91,13 +91,13 @@ mod tests {
         assert_eq!(
             parse([
                 "--profile".into(),
-                "/etc/usb-gadget-supervisor/yubikey.toml".into(),
+                "/opt/usb-gadget-supervisor/profiles/yubikey.toml".into(),
                 "--udc".into(),
                 "fe980000.usb".into(),
             ])
             .unwrap(),
             Options {
-                profile: "/etc/usb-gadget-supervisor/yubikey.toml".into(),
+                profile: "/opt/usb-gadget-supervisor/profiles/yubikey.toml".into(),
                 udc: Some("fe980000.usb".into()),
                 check_profile: false,
             }

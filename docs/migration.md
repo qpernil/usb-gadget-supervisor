@@ -39,7 +39,7 @@ behave identically throughout the move.
 | Supervisor branch in `src/main.rs` | `usb-gadget-supervisor` binary |
 | Worker branch in `src/main.rs` | `virtual-yubikey-worker` binary |
 | `src/functionfs.rs` | Remains in `virtual-yubikey` |
-| `src/usb_identity.rs` | Becomes YubiKey profile/descriptor assets and worker consistency tests |
+| `src/usb_identity.rs` | Becomes YubiKey profile identity and worker consistency tests |
 | `src/ctaphid.rs`, `src/ccid.rs`, `src/smartcard.rs` | Remain in `virtual-yubikey` |
 | `virtual-yubikey-core`, `virtual-yubikey-crypto` | Remain in `virtual-yubikey` |
 | Root systemd service | Starts the generic supervisor with a YubiKey profile |
@@ -66,7 +66,7 @@ This validates the profile model without a cross-repository protocol change.
 
 - Move generic ConfigFS, FunctionFS mounting, UDC selection, privilege drop,
   readiness, lifecycle, and cleanup code to this repository.
-- Install a root-owned YubiKey profile with the existing descriptor assets.
+- Install one root-owned YubiKey profile with inline descriptor bytes.
 - Start the existing YubiKey worker as an external command.
 - Replace the current stream readiness byte with the versioned worker protocol
   while preserving startup ordering.
@@ -82,7 +82,7 @@ This validates the profile model without a cross-repository protocol change.
 
 ### 5. Add the Trezor One worker
 
-- Install a separate Trezor profile and worker executable.
+- Build the Trezor worker in its Git tree and install only its profile.
 - Exercise direct FunctionFS endpoints, worker-requested USB reconnect, I2C
   display, and GPIO buttons.
 - Use differences between YubiKey and Trezor to revise the profile and worker

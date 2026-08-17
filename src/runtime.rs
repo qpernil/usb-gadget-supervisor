@@ -1,6 +1,8 @@
 //! Privileged Linux ConfigFS, FunctionFS, UDC, and worker lifecycle.
 
-use crate::profile::{FunctionProfile, Profile, ResourceAccess};
+use crate::profile::{
+    decode_hex_descriptor, FunctionProfile, HidFunction, Profile, ResourceAccess,
+};
 use crate::protocol::{
     Message, CONTROL_FD_ENV, FUNCTIONFS_ENV_PREFIX, HID_ENV_PREFIX, PACKET_LENGTH,
     RESOURCE_FD_ENV_PREFIX, RUNTIME_DIRECTORY_ENV, STATE_DIRECTORY_ENV,
@@ -58,14 +60,16 @@ impl Runtime {
         }
 
         validate_root_owned_file(&profile_path, "profile")?;
-        validate_root_owned_file(&profile.worker.command, "worker executable")?;
+        let identity = resolve_worker_identity(&profile.worker.run_as)?;
+        validate_worker_executable(&profile.worker.command, &identity)?;
         for function in &profile.functions {
             if let FunctionProfile::Hid(hid) = function {
-                validate_root_owned_file(&hid.report_descriptor, "HID report descriptor")?;
+                if let Some(path) = &hid.report_descriptor {
+                    validate_root_owned_file(path, "HID report descriptor")?;
+                }
             }
         }
 
-        let identity = resolve_worker_identity(&profile.worker.run_as)?;
         let lock = acquire_lock()?;
         let configfs_mounted_by_us = ensure_configfs()?;
         let gadget = Path::new(GADGET_ROOT).join(&profile.name);
@@ -277,10 +281,7 @@ impl Runtime {
                         &directory.join("report_length"),
                         &hid.report_length.to_string(),
                     )?;
-                    fs::write(
-                        directory.join("report_desc"),
-                        read_hex_descriptor(&hid.report_descriptor)?,
-                    )?;
+                    fs::write(directory.join("report_desc"), hid_report_descriptor(hid)?)?;
                 }
                 FunctionProfile::Functionfs(ffs) => {
                     fs::create_dir(self.gadget.join(format!("functions/ffs.{}", ffs.name)))?;
@@ -618,6 +619,49 @@ fn validate_root_owned_file(path: &Path, label: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_worker_executable(path: &Path, identity: &WorkerIdentity) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("inspect worker executable {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(format!(
+            "worker executable {} must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    if (metadata.uid() != 0 && metadata.uid() != identity.uid) || metadata.mode() & 0o6022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "worker executable {} must be owned by root or {}, non-set-ID, and not group/world writable",
+                path.display(), identity.name
+            ),
+        ));
+    }
+
+    let executable_bit = if metadata.uid() == identity.uid {
+        0o100
+    } else if metadata.gid() == identity.gid {
+        0o010
+    } else {
+        0o001
+    };
+    if metadata.mode() & executable_bit == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "worker executable {} is not executable by {}",
+                path.display(),
+                identity.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_worker_identity(name: &str) -> io::Result<WorkerIdentity> {
     let uid = query_account_id("-u", name)?;
     let gid = query_account_id("-g", name)?;
@@ -758,24 +802,18 @@ fn prepare_device(path: &Path, uid: u32, gid: u32, timeout: Duration) -> io::Res
     }
 }
 
-fn read_hex_descriptor(path: &Path) -> io::Result<Vec<u8>> {
-    let source = fs::read_to_string(path)?;
-    let mut descriptor = Vec::new();
-    for token in source.split_whitespace() {
-        descriptor.push(u8::from_str_radix(token, 16).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid hexadecimal byte {token:?} in {}", path.display()),
-            )
-        })?);
+fn hid_report_descriptor(hid: &HidFunction) -> io::Result<Vec<u8>> {
+    match (&hid.report_descriptor, &hid.report_descriptor_hex) {
+        (Some(path), None) => {
+            let source = fs::read_to_string(path)?;
+            decode_hex_descriptor(&source, &path.display().to_string())
+        }
+        (None, Some(source)) => decode_hex_descriptor(source, "inline HID report descriptor"),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HID report descriptor source was not validated",
+        )),
     }
-    if descriptor.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} contains an empty HID report descriptor", path.display()),
-        ));
-    }
-    Ok(descriptor)
 }
 
 fn seqpacket_pair() -> io::Result<(UnixStream, UnixStream)> {
