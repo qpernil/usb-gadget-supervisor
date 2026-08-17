@@ -2,9 +2,9 @@
 
 Thank you for helping improve USB Gadget Supervisor.
 
-The repository is currently documentation-first. Please discuss substantial
+The repository is currently alpha quality. Please discuss substantial
 architecture or protocol changes in an issue before implementing them. Small
-documentation corrections can go directly to a pull request.
+code and documentation corrections can go directly to a pull request.
 
 ## Design constraints
 

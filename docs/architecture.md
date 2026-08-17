@@ -147,6 +147,10 @@ private-key material.
 Profiles must be regular root-owned files, must not be writable by the worker,
 and must use a strict schema. Worker executable paths and auxiliary descriptor
 files must be absolute, non-symlinked where practical, and not worker-writable.
+Profile-declared local hardware is opened by the supervisor before credential
+drop and inherited by descriptor. The worker owns every ioctl, framebuffer,
+button, and UI policy decision; the supervisor is only a narrow descriptor
+broker.
 
 Workers remain development-grade software security devices. Process separation
 reduces accidental privilege exposure; it does not provide physical tamper

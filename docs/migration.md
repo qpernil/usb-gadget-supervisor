@@ -1,5 +1,25 @@
 # Migration from Virtual YubiKey
 
+## Current status
+
+Phases 1–4 are implemented in source:
+
+- the pre-extraction protocol suite remains green;
+- USB identity, interface order, and HID descriptor bytes are frozen by the
+  device project's installed-profile test;
+- ConfigFS, FunctionFS mounting, UDC binding, credential dropping, cleanup, and
+  worker supervision now live in `usb-gadget-supervisor`;
+- `virtual-yubikey` builds only the dedicated unprivileged
+  `virtual-yubikey-worker` plus its touch helper; and
+- the one-byte stream handshake has been replaced by revision 1 of the fixed
+  `SOCK_SEQPACKET` worker protocol.
+
+The extracted pair was deployed on an aarch64 Raspberry Pi on 2026-08-17. UDC
+enumeration, existing-state loading, macOS CCID/PIV probing, worker-crash
+cleanup, systemd recovery, and the exclusive lock passed. Full host-level FIDO
+registration/assertion and state-mutating PIV regression tests remain the final
+acceptance gate. Phase 5, the Trezor One worker, has not started.
+
 ## Existing boundary
 
 `virtual-yubikey` already contains a root supervisor and an unprivileged worker

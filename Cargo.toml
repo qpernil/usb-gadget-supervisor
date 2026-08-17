@@ -1,0 +1,18 @@
+[package]
+name = "usb-gadget-supervisor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Privilege-separated Linux USB gadget lifecycle supervisor"
+license = "MIT"
+readme = "README.md"
+keywords = ["raspberry-pi", "usb-gadget", "functionfs", "configfs"]
+categories = ["hardware-support", "command-line-utilities"]
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "0.9.12"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.189"

@@ -6,9 +6,8 @@ A profile is a declarative, root-owned description of one host-visible USB
 device and its worker. Profiles keep device identities and descriptors in their
 own projects while allowing the supervisor to remain protocol-neutral.
 
-TOML is proposed for the first implementation because the documents are
-operator-readable and the schema can be strictly deserialized with unknown
-fields rejected.
+Revision 1 uses TOML because the documents are operator-readable and the schema
+is strictly deserialized with unknown fields rejected.
 
 ## Draft structure
 
@@ -27,15 +26,28 @@ device_subclass = 0
 device_protocol = 0
 manufacturer = "Yubico"
 product = "YubiKey FIDO+CCID"
-serial = "none"
-max_power_ma = 60
+# Omit serial to expose no USB iSerialNumber string.
+max_power_ma = 30
 
 [worker]
-command = "/usr/libexec/virtual-yubikey/virtual-yubikey-worker"
-run_as = "virtual-devices"
+command = "/usr/local/libexec/virtual-yubikey/virtual-yubikey-worker"
+arguments = ["--serial", "12345678", "--log-level", "info"]
+run_as = "per"
 readiness_timeout_ms = 10000
 state_directory = "/var/lib/virtual-yubikey"
 runtime_directory = "/run/virtual-yubikey"
+
+[[resources]]
+name = "display-i2c"
+path = "/dev/i2c-1"
+access = "read-write"
+optional = true
+
+[[resources]]
+name = "buttons-gpio"
+path = "/dev/gpiochip0"
+access = "read-write"
+optional = true
 
 [[functions]]
 type = "hid"
@@ -43,7 +55,8 @@ name = "fido"
 protocol = 0
 subclass = 0
 report_length = 64
-report_descriptor = "/usr/share/virtual-yubikey/fido-hid-report.bin"
+report_descriptor = "/usr/local/share/virtual-yubikey/fido-hid-report.hex"
+device = "/dev/hidg0"
 
 [[functions]]
 type = "functionfs"
@@ -53,6 +66,21 @@ mount = "/dev/ffs-virtual-yubikey"
 
 Function order is significant because ConfigFS assigns interface numbers in
 link order.
+
+## Local hardware resources
+
+`[[resources]]` entries let the root supervisor open a character device before
+starting the unprivileged worker. `access` is `read`, `write`, or `read-write`.
+If `optional` is false or omitted, missing or inaccessible hardware prevents
+startup. If it is true, a missing node is logged and omitted from the worker
+environment, allowing the same profile to run headlessly.
+
+The supervisor verifies that each resource is a non-symlink character device
+under `/dev`. It passes the open descriptor as
+`USB_GADGET_RESOURCE_<NORMALIZED_NAME>_FD`; all device-specific operations stay
+in the worker. A future Virtual YubiKey/Trezor OLED profile can therefore share
+root-only `/dev/i2c-1` and a selected `/dev/gpiochipN` without putting either
+worker in broad hardware groups.
 
 ## Trezor One sketch
 
@@ -75,7 +103,7 @@ device_subclass = 0
 device_protocol = 0
 manufacturer = "SatoshiLabs"
 product = "TREZOR"
-serial = "worker"
+# The initial schema supports an omitted or static USB serial string.
 max_power_ma = 100
 
 [worker]
@@ -96,8 +124,8 @@ name = "u2f"
 protocol = 0
 subclass = 0
 report_length = 64
-report_descriptor = "/usr/share/virtual-trezor/u2f-hid-report.bin"
-optional = true
+report_descriptor = "/usr/share/virtual-trezor/u2f-hid-report.hex"
+device = "/dev/hidg0"
 ```
 
 Whether the main, debug, and U2F interfaces are all published by one FunctionFS
@@ -114,6 +142,8 @@ The supervisor must reject profiles that violate any of these conditions:
 - Worker command, profile, or descriptor files writable by the target worker.
 - Invalid VID/PID, USB version, endpoint size, power, class, or protocol values.
 - Duplicate function names or mount paths.
+- Duplicate resource names, normalized environment keys, or device paths.
+- Resource paths outside `/dev` or resources that are not character devices.
 - FunctionFS mounts outside an approved `/dev/ffs-*` namespace.
 - A root worker account.
 - A profile that declares no functions.
@@ -129,6 +159,10 @@ Each device project installs its own profile and descriptor assets. Tests in
 that project must compare the profile's advertised identity and capabilities
 with the worker's logical device profile so USB metadata cannot drift from
 implemented behavior.
+
+HID descriptor assets contain whitespace-separated hexadecimal bytes. The
+supervisor decodes them before writing ConfigFS `report_desc`; keeping the asset
+textual makes device-project reviews and fixture tests straightforward.
 
 The supervisor validates structure and safety; it does not decide whether a
 particular YubiKey or Trezor identity is semantically correct.
