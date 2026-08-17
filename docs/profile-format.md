@@ -30,7 +30,7 @@ product = "YubiKey FIDO+CCID"
 max_power_ma = 30
 
 [worker]
-command = "/usr/local/libexec/virtual-yubikey/virtual-yubikey-worker"
+command = "/home/per/virtual-yubikey/target/release/virtual-yubikey-worker"
 arguments = ["--serial", "12345678", "--log-level", "info"]
 run_as = "per"
 readiness_timeout_ms = 10000
@@ -55,7 +55,11 @@ name = "fido"
 protocol = 0
 subclass = 0
 report_length = 64
-report_descriptor = "/usr/local/share/virtual-yubikey/fido-hid-report.hex"
+report_descriptor_hex = """
+06 d0 f1 09 01 a1 01 09 20 15 00 26 ff 00 75 08
+95 40 81 02 09 21 15 00 26 ff 00 75 08 95 40 91 02
+c0
+"""
 device = "/dev/hidg0"
 
 [[functions]]
@@ -107,8 +111,8 @@ product = "TREZOR"
 max_power_ma = 100
 
 [worker]
-command = "/usr/libexec/virtual-trezor/trezor-one-pi"
-run_as = "virtual-devices"
+command = "/home/per/virtual-trezor/build/trezor-one-pi"
+run_as = "per"
 readiness_timeout_ms = 10000
 state_directory = "/var/lib/virtual-trezor"
 runtime_directory = "/run/virtual-trezor"
@@ -124,7 +128,12 @@ name = "u2f"
 protocol = 0
 subclass = 0
 report_length = 64
-report_descriptor = "/usr/share/virtual-trezor/u2f-hid-report.hex"
+# Use the exact descriptor bytes from the pinned Trezor firmware release.
+report_descriptor_hex = """
+06 d0 f1 09 01 a1 01 09 20 15 00 26 ff 00 75 08
+95 40 81 02 09 21 15 00 26 ff 00 75 08 95 40 91 02
+c0
+"""
 device = "/dev/hidg0"
 ```
 
@@ -139,7 +148,9 @@ The supervisor must reject profiles that violate any of these conditions:
 
 - Unknown schema version or unknown fields.
 - Empty, relative, or traversal-containing runtime paths.
-- Worker command, profile, or descriptor files writable by the target worker.
+- A profile or file-backed descriptor writable by the target worker.
+- A worker command not owned by root or the target worker, with set-ID bits,
+  group/world write bits, or without an applicable execute bit.
 - Invalid VID/PID, USB version, endpoint size, power, class, or protocol values.
 - Duplicate function names or mount paths.
 - Duplicate resource names, normalized environment keys, or device paths.
@@ -155,14 +166,19 @@ directories rather than symlinks before changing ownership or permissions.
 
 ## Source of truth
 
-Each device project installs its own profile and descriptor assets. Tests in
-that project must compare the profile's advertised identity and capabilities
-with the worker's logical device profile so USB metadata cannot drift from
-implemented behavior.
+Each device project installs one profile into
+`/opt/usb-gadget-supervisor/profiles`. The profile should contain HID report
+descriptor bytes inline with `report_descriptor_hex`, so no separately
+installed descriptor asset is needed. `report_descriptor` remains available
+for an absolute, root-owned file when an inline descriptor is impractical;
+exactly one of the two keys is required for each HID function.
 
-HID descriptor assets contain whitespace-separated hexadecimal bytes. The
-supervisor decodes them before writing ConfigFS `report_desc`; keeping the asset
-textual makes device-project reviews and fixture tests straightforward.
+Tests in the device project must compare the profile's advertised identity and
+capabilities with the worker's logical device profile so USB metadata cannot
+drift from implemented behavior.
+
+HID descriptors contain whitespace-separated hexadecimal bytes. The supervisor
+decodes them before writing ConfigFS `report_desc`.
 
 The supervisor validates structure and safety; it does not decide whether a
 particular YubiKey or Trezor identity is semantically correct.

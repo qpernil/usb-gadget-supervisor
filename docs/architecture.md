@@ -145,8 +145,14 @@ wallet commands, APDUs, CTAP messages, Trezor protobuf messages, PINs, seeds, or
 private-key material.
 
 Profiles must be regular root-owned files, must not be writable by the worker,
-and must use a strict schema. Worker executable paths and auxiliary descriptor
-files must be absolute, non-symlinked where practical, and not worker-writable.
+and must use a strict schema. Auxiliary descriptor files, when used instead of
+inline descriptor bytes, have the same requirements. Worker executables must
+be absolute regular non-symlink files, owned by root or the configured worker,
+free of set-ID and group/world write bits, and executable by that identity. A
+worker may therefore run directly from its Git build directory: it is executed
+only after supplementary groups, GID, and UID are dropped and
+`PR_SET_NO_NEW_PRIVS` is set. Replacing that worker changes device behavior but
+cannot inject code into the privileged supervisor.
 Profile-declared local hardware is opened by the supervisor before credential
 drop and inherited by descriptor. The worker owns every ioctl, framebuffer,
 button, and UI policy decision; the supervisor is only a narrow descriptor

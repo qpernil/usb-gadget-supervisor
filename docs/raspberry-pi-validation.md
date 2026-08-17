@@ -7,10 +7,10 @@ described in the Virtual YubiKey README.
 ## Preflight
 
 ```sh
-usb-gadget-supervisor --check-profile \
-  --profile /etc/usb-gadget-supervisor/profiles/virtual-yubikey.toml
+/opt/usb-gadget-supervisor/usb-gadget-supervisor --check-profile \
+  --profile /opt/usb-gadget-supervisor/profiles/virtual-yubikey.toml
 ls /sys/class/udc
-sudo systemctl stop virtual-yubikey.service
+sudo systemctl stop usb-gadget-supervisor@virtual-yubikey.service
 ```
 
 Confirm that no legacy `g_*` gadget module or another ConfigFS gadget owns the
@@ -20,9 +20,10 @@ same FIDO and PIV state files are exercised.
 ## Start and enumerate
 
 ```sh
-sudo systemctl start virtual-yubikey.service
-systemctl --no-pager --full status virtual-yubikey.service
-journalctl -u virtual-yubikey.service -b --no-pager
+sudo systemctl start usb-gadget-supervisor@virtual-yubikey.service
+systemctl --no-pager --full status \
+  usb-gadget-supervisor@virtual-yubikey.service
+journalctl -u usb-gadget-supervisor@virtual-yubikey.service -b --no-pager
 cat /sys/class/udc/*/state
 mount | grep ffs-virtual-yubikey
 stat /dev/hidg0

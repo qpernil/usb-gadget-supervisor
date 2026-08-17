@@ -77,7 +77,8 @@ pub(crate) struct HidFunction {
     pub(crate) protocol: u8,
     pub(crate) subclass: u8,
     pub(crate) report_length: u16,
-    pub(crate) report_descriptor: PathBuf,
+    pub(crate) report_descriptor: Option<PathBuf>,
+    pub(crate) report_descriptor_hex: Option<String>,
     pub(crate) device: PathBuf,
 }
 
@@ -196,7 +197,24 @@ impl Profile {
                     if hid.report_length == 0 || hid.report_length > 4096 {
                         return invalid("HID report_length must be between 1 and 4096");
                     }
-                    validate_absolute("HID report_descriptor", &hid.report_descriptor)?;
+                    match (&hid.report_descriptor, &hid.report_descriptor_hex) {
+                        (Some(path), None) => {
+                            validate_absolute("HID report_descriptor", path)?;
+                        }
+                        (None, Some(descriptor)) => {
+                            decode_hex_descriptor(descriptor, "inline HID report descriptor")?;
+                        }
+                        (None, None) => {
+                            return invalid(
+                                "HID functions need report_descriptor or report_descriptor_hex",
+                            );
+                        }
+                        (Some(_), Some(_)) => {
+                            return invalid(
+                                "HID functions must not set both report_descriptor and report_descriptor_hex",
+                            );
+                        }
+                    }
                     validate_absolute("HID device", &hid.device)?;
                     let device_name = hid
                         .device
@@ -301,6 +319,25 @@ fn invalid<T>(message: impl Into<String>) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
 }
 
+pub(crate) fn decode_hex_descriptor(source: &str, label: &str) -> io::Result<Vec<u8>> {
+    let mut descriptor = Vec::new();
+    for token in source.split_whitespace() {
+        descriptor.push(u8::from_str_radix(token, 16).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid hexadecimal byte {token:?} in {label}"),
+            )
+        })?);
+    }
+    if descriptor.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} is empty"),
+        ));
+    }
+    Ok(descriptor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +413,42 @@ mount = "/dev/ffs-test-device"
         );
         let profile: Profile = toml::from_str(&source).unwrap();
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_an_inline_hid_report_descriptor() {
+        let source = format!(
+            "{VALID}\n[[functions]]\ntype = \"hid\"\nname = \"fido\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor_hex = \"06 d0 f1 09 01 c0\"\ndevice = \"/dev/hidg0\"\n"
+        );
+        let profile: Profile = toml::from_str(&source).unwrap();
+        profile.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_or_ambiguous_hid_report_descriptors() {
+        let missing = format!(
+            "{VALID}\n[[functions]]\ntype = \"hid\"\nname = \"fido\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\ndevice = \"/dev/hidg0\"\n"
+        );
+        assert!(toml::from_str::<Profile>(&missing)
+            .unwrap()
+            .validate()
+            .is_err());
+
+        let both = format!(
+            "{VALID}\n[[functions]]\ntype = \"hid\"\nname = \"fido\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor = \"/usr/share/test.hex\"\nreport_descriptor_hex = \"06 d0 f1 09 01 c0\"\ndevice = \"/dev/hidg0\"\n"
+        );
+        assert!(toml::from_str::<Profile>(&both)
+            .unwrap()
+            .validate()
+            .is_err());
+
+        let invalid_hex = format!(
+            "{VALID}\n[[functions]]\ntype = \"hid\"\nname = \"fido\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor_hex = \"not-hex\"\ndevice = \"/dev/hidg0\"\n"
+        );
+        assert!(toml::from_str::<Profile>(&invalid_hex)
+            .unwrap()
+            .validate()
+            .is_err());
     }
 
     #[test]
