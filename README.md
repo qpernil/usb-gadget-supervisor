@@ -127,6 +127,12 @@ Updating the worker is therefore `git pull`, rebuild, and restart. Only profile
 changes require reinstalling the profile. Since one UDC can expose only one
 identity, stop the currently active profile before starting another one.
 
+The worker file may be owned by root or by `run_as`. It may also be writable by
+the `run_as` primary group, which accommodates a normal collaborative build
+umask. Set-ID, world-writable, and unrelated-group-writable workers are
+rejected. This does not cross the root boundary because the worker is executed
+only after the supervisor has dropped to that identity.
+
 The same profile can be run manually after stopping its service:
 
 ```sh

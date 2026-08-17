@@ -149,8 +149,9 @@ The supervisor must reject profiles that violate any of these conditions:
 - Unknown schema version or unknown fields.
 - Empty, relative, or traversal-containing runtime paths.
 - A profile or file-backed descriptor writable by the target worker.
-- A worker command not owned by root or the target worker, with set-ID bits,
-  group/world write bits, or without an applicable execute bit.
+- A worker command not owned by root or the target worker, with set-ID or world
+  write bits, writable by a group other than the worker's primary group, or
+  without an applicable execute bit.
 - Invalid VID/PID, USB version, endpoint size, power, class, or protocol values.
 - Duplicate function names or mount paths.
 - Duplicate resource names, normalized environment keys, or device paths.

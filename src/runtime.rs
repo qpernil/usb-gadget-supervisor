@@ -632,11 +632,16 @@ fn validate_worker_executable(path: &Path, identity: &WorkerIdentity) -> io::Res
             path.display()
         )));
     }
-    if (metadata.uid() != 0 && metadata.uid() != identity.uid) || metadata.mode() & 0o6022 != 0 {
+    let mode = metadata.mode();
+    let invalid_owner = metadata.uid() != 0 && metadata.uid() != identity.uid;
+    let set_id = mode & 0o6000 != 0;
+    let world_writable = mode & 0o0002 != 0;
+    let foreign_group_writable = mode & 0o0020 != 0 && metadata.gid() != identity.gid;
+    if invalid_owner || set_id || world_writable || foreign_group_writable {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "worker executable {} must be owned by root or {}, non-set-ID, and not group/world writable",
+                "worker executable {} must be owned by root or {}, non-set-ID, not world writable, and writable by no group other than the worker's primary group",
                 path.display(), identity.name
             ),
         ));
@@ -649,7 +654,7 @@ fn validate_worker_executable(path: &Path, identity: &WorkerIdentity) -> io::Res
     } else {
         0o001
     };
-    if metadata.mode() & executable_bit == 0 {
+    if mode & executable_bit == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
