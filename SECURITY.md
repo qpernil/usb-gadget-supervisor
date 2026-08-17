@@ -1,8 +1,8 @@
 # Security Policy
 
-USB Gadget Supervisor is security-sensitive infrastructure, but it is not yet
-implemented or released. The current repository contains design documentation
-only.
+USB Gadget Supervisor is security-sensitive alpha infrastructure. It has not
+been released as stable or validated on every supported Raspberry Pi/kernel
+combination.
 
 ## Reporting a vulnerability
 

@@ -11,21 +11,39 @@ not stdin or stdout: those remain available for normal process behavior and
 diagnostics. Packet boundaries make the protocol unambiguous without a streaming
 decoder.
 
-This document defines semantic messages first. The byte-level encoding remains
-unstable until the YubiKey extraction and Trezor worker have both exercised it.
+Revision 1 is implemented by both `usb-gadget-supervisor` and
+`virtual-yubikey-worker`. Its semantics remain alpha until the Trezor worker has
+also exercised it, but its byte fixture is explicit and tested in both
+repositories.
+
+## Revision 1 encoding
+
+Every `SOCK_SEQPACKET` record is exactly eight bytes:
+
+| Offset | Size | Meaning |
+| --- | --- | --- |
+| 0 | 4 | ASCII magic `UGSP` |
+| 4 | 1 | Protocol version, currently `1` |
+| 5 | 1 | Message type |
+| 6 | 2 | Big-endian flags, currently zero |
+
+Message type values are `0x01`–`0x04` for supervisor messages and
+`0x81`–`0x84` for worker messages, in the order shown below. Unknown versions,
+types, flags, truncated records, and EOF fail closed.
 
 ## Startup
 
 1. The supervisor validates the profile, creates the unbound ConfigFS gadget,
    mounts FunctionFS, and prepares the runtime directory.
-2. It creates a `SOCK_SEQPACKET` pair and starts the worker with one endpoint
-   inherited. The descriptor number is supplied through a dedicated environment
-   variable or argument.
+2. It opens every available profile-declared local character device, creates a
+   `SOCK_SEQPACKET` pair, and starts the worker with those descriptors inherited.
+   Descriptor numbers are supplied through the environment.
 3. Before `exec`, the supervisor clears supplementary groups, sets the target
    GID and UID, enables `PR_SET_NO_NEW_PRIVS`, and installs a parent-death
    signal.
-4. The worker opens FunctionFS `ep0`, writes its descriptors and strings, and
-   opens the data endpoints required before attachment.
+4. The supervisor sends `RESOURCES_READY`. The worker opens FunctionFS `ep0`,
+   writes its descriptors and strings, and opens the data endpoints required
+   before attachment.
 5. The worker sends `FUNCTIONFS_READY`.
 6. The supervisor links profile functions in deterministic order, binds the UDC,
    and prepares post-bind nodes such as `/dev/hidgN`.
@@ -53,9 +71,50 @@ unstable until the YubiKey extraction and Trezor worker have both exercised it.
 | `STOPPED` | Graceful shutdown is complete |
 | `FATAL` | Worker cannot continue; supervisor must unbind and tear down |
 
-The protocol must include a version during its first encoded revision. Unknown
-message types or incompatible versions terminate startup rather than being
-silently ignored.
+The current message values are:
+
+| Message | Value |
+| --- | --- |
+| `RESOURCES_READY` | `0x01` |
+| `USB_ATTACHED` | `0x02` |
+| `USB_DETACHED` | `0x03` |
+| `SHUTDOWN` | `0x04` |
+| `FUNCTIONFS_READY` | `0x81` |
+| `RECONNECT_REQUEST` | `0x82` |
+| `STOPPED` | `0x83` |
+| `FATAL` | `0x84` |
+
+## Inherited environment
+
+The supervisor clears the worker environment, then supplies only its resource
+contract:
+
+| Variable | Meaning |
+| --- | --- |
+| `USB_GADGET_CONTROL_FD` | Decimal inherited control descriptor |
+| `USB_GADGET_STATE_DIRECTORY` | Profile-owned persistent state directory |
+| `USB_GADGET_RUNTIME_DIRECTORY` | Volatile worker runtime directory |
+| `USB_GADGET_FUNCTIONFS_<NAME>` | Named FunctionFS mount path |
+| `USB_GADGET_HID_<NAME>` | Named ConfigFS HID device path |
+| `USB_GADGET_RESOURCE_<NAME>_FD` | Decimal inherited descriptor for a profile-declared local character device |
+
+Function and resource names are uppercased and non-alphanumeric characters
+become `_`. For example, `display-i2c` becomes
+`USB_GADGET_RESOURCE_DISPLAY_I2C_FD`. An unavailable optional resource has no
+environment variable. A C worker can consume the same environment and fixed
+structure without a Rust dependency.
+
+The supervisor opens declared resources before `setgroups`, `setgid`, and
+`setuid`, then clears `FD_CLOEXEC` only for the approved descriptors. Device
+nodes may therefore remain root-only and the worker needs no supplementary
+`i2c` or `gpio` group. The supervisor neither issues I2C/GPIO ioctls nor knows
+display addresses, GPIO offsets, button meanings, or framebuffer formats.
+
+Descriptor confinement is at device-node granularity. An inherited I2C bus
+descriptor may address other devices on that bus, and an inherited GPIO-chip
+descriptor may request other lines on that chip. Profiles should expose the
+narrowest suitable device nodes, and workers must still constrain addresses
+and lines internally.
 
 ## Data path
 
@@ -66,11 +125,11 @@ host OUT transfer -> FunctionFS endpoint file -> worker
 host IN transfer  <- FunctionFS endpoint file <- worker
 ```
 
-ConfigFS HID functions may expose `/dev/hidgN` only after UDC bind. The
-supervisor can open the node and pass the descriptor with `USB_ATTACHED`, which
-avoids global `chown`, device-number races, and worker access to unrelated HID
-gadget nodes. The existing YubiKey implementation may initially retain its
-current chown-and-open behavior during migration.
+ConfigFS HID functions may expose `/dev/hidgN` only after UDC bind. A future
+revision can open the node and pass the descriptor with `USB_ATTACHED`, avoiding
+global `chown` and device-number races. Revision 1 retains the migration path:
+the profile declares `/dev/hidgN`, the supervisor changes that node's ownership
+after bind, and the worker opens the inherited path after `USB_ATTACHED`.
 
 ## Reconnect
 

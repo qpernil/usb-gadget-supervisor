@@ -1,9 +1,9 @@
 # USB Gadget Supervisor
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Status: design](https://img.shields.io/badge/status-design-orange.svg)](#status)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
-`usb-gadget-supervisor` is a privilege-separated Linux service design for
+`usb-gadget-supervisor` is a privilege-separated Linux service for
 running protocol-compatible USB device workers on a USB Device Controller
 (UDC), especially on Raspberry Pi 4 and Raspberry Pi 5.
 
@@ -12,14 +12,11 @@ ConfigFS, FunctionFS mounts, UDC binding, process credentials, lifecycle, and
 cleanup. Device behavior belongs to separate unprivileged workers such as
 `virtual-yubikey`, `virtual-trezor`, and a future `virtual-yubihsm`.
 
-This repository is documentation-first. It intentionally contains no runtime
-implementation yet.
-
 The goal is a deliberately small privileged boundary: the supervisor performs
 the Linux operations that require root, while each device implementation stays
 in its own independently testable process.
 
-## Intended architecture
+## Architecture
 
 ```text
                          USB-C device port
@@ -69,10 +66,11 @@ The supervisor retains control only over gadget configuration and lifecycle.
 
 ## Scope
 
-The planned supervisor will:
+The supervisor:
 
 - load one strictly validated, root-owned device profile;
 - create and tear down ConfigFS gadgets and FunctionFS mounts;
+- open explicitly declared local character devices before dropping privileges;
 - start one worker with inherited endpoint and control descriptors;
 - drop the worker to a configured unprivileged account;
 - bind the gadget only after the worker reports readiness; and
@@ -81,6 +79,39 @@ The planned supervisor will:
 It will not implement FIDO, CCID, Trezor, YubiHSM, cryptography, key storage, or
 device UI. Those concerns stay in the worker repositories.
 
+## Build
+
+Rust 1.85 or later is required. The binary is Linux-only, while profile and
+wire-format unit tests also run on macOS:
+
+```sh
+cargo build --release --locked
+cargo test --locked
+```
+
+Run it as root with one absolute, root-owned profile path:
+
+```sh
+sudo ./target/release/usb-gadget-supervisor \
+  --profile /etc/usb-gadget-supervisor/profiles/virtual-yubikey.toml
+```
+
+An optional `--udc NAME` selects a controller instead of the first available
+entry in `/sys/class/udc`.
+
+Profiles can be schema-checked without root or USB hardware:
+
+```sh
+usb-gadget-supervisor --check-profile --profile /absolute/path/to/profile.toml
+```
+
+The selected worker receives a private `AF_UNIX/SOCK_SEQPACKET` control socket,
+state/runtime directory paths, named FunctionFS/HID resources, and any
+profile-approved local-hardware file descriptors in its environment. This lets
+I2C and GPIO device nodes remain root-only while display and button semantics
+stay entirely inside the device worker. See the
+[worker protocol](docs/worker-protocol.md) for the exact contract.
+
 ## Documents
 
 - [Architecture](docs/architecture.md)
@@ -88,20 +119,33 @@ device UI. Those concerns stay in the worker repositories.
 - [Profile format](docs/profile-format.md)
 - [Trezor One worker](docs/trezor-one.md)
 - [Migration from Virtual YubiKey](docs/migration.md)
+- [Raspberry Pi validation](docs/raspberry-pi-validation.md)
 
 ## Status
 
-The first implementation target is extraction of the existing, working
-ConfigFS/FunctionFS supervisor from `virtual-yubikey`, without changing the
-YubiKey worker's observable USB behavior. The second worker will be the Trezor
-One port; it will be used to validate which abstractions are genuinely common
-before declaring a stable supervisor API.
+The initial Rust implementation and the dedicated `virtual-yubikey-worker`
+migration are complete in source. Profile parsing is strict, the lifecycle
+protocol has a fixed revision-1 wire encoding, and both repositories pass unit
+tests and Linux-target compilation.
+
+The extracted supervisor and Virtual YubiKey worker were deployed together on
+an aarch64 Raspberry Pi on 2026-08-17. The Pi reached UDC state `configured`,
+macOS enumerated `1050:0406`, existing PIV state loaded, worker-crash cleanup and
+systemd recovery passed, the exclusive UDC lock rejected a second instance, and
+host `ykman`/`yubico-piv-tool` read Management, FIDO2, and preserved PIV status.
+Full host-level FIDO registration/assertion and PIV mutation regression tests
+remain before the migration is considered a release. The first implementation
+still prepares configured `/dev/hidgN` paths
+by ownership after UDC bind; passing HID descriptors with `SCM_RIGHTS` remains a
+planned hardening step. The second worker will be the Trezor One port, which
+will test whether the current abstractions are genuinely generic before the API
+is declared stable.
 
 See [migration.md](docs/migration.md) for the proposed delivery sequence.
 
 ## Contributing
 
-This project is currently at the design stage. Design reviews, Linux USB gadget
+This project is currently alpha quality. Design reviews, Linux USB gadget
 experience, and Raspberry Pi hardware reports are welcome. Please read
 [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
