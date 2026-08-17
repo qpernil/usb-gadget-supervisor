@@ -148,7 +148,8 @@ Profiles must be regular root-owned files, must not be writable by the worker,
 and must use a strict schema. Auxiliary descriptor files, when used instead of
 inline descriptor bytes, have the same requirements. Worker executables must
 be absolute regular non-symlink files, owned by root or the configured worker,
-free of set-ID and group/world write bits, and executable by that identity. A
+free of set-ID and world write bits, writable by no group other than the
+worker's primary group, and executable by that identity. A
 worker may therefore run directly from its Git build directory: it is executed
 only after supplementary groups, GID, and UID are dropped and
 `PR_SET_NO_NEW_PRIVS` is set. Replacing that worker changes device behavior but
