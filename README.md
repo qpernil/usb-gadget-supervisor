@@ -1,5 +1,6 @@
 # USB Gadget Supervisor
 
+[![CI](https://github.com/qpernil/usb-gadget-supervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/qpernil/usb-gadget-supervisor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
