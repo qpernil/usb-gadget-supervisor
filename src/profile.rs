@@ -1,3 +1,4 @@
+use crate::functionfs;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
@@ -87,6 +88,8 @@ pub(crate) struct HidFunction {
 pub(crate) struct FunctionFsFunction {
     pub(crate) name: String,
     pub(crate) mount: PathBuf,
+    pub(crate) descriptors_hex: String,
+    pub(crate) strings_hex: String,
 }
 
 impl Profile {
@@ -261,6 +264,15 @@ impl Profile {
                             ffs.mount.display()
                         ));
                     }
+                    let descriptors = decode_hex_blob(
+                        &ffs.descriptors_hex,
+                        &format!("FunctionFS {} descriptors", ffs.name),
+                    )?;
+                    let strings = decode_hex_blob(
+                        &ffs.strings_hex,
+                        &format!("FunctionFS {} strings", ffs.name),
+                    )?;
+                    functionfs::inspect(&descriptors, &strings)?;
                 }
             }
         }
@@ -319,7 +331,7 @@ fn invalid<T>(message: impl Into<String>) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
 }
 
-pub(crate) fn decode_hex_descriptor(source: &str, label: &str) -> io::Result<Vec<u8>> {
+pub(crate) fn decode_hex_blob(source: &str, label: &str) -> io::Result<Vec<u8>> {
     let mut descriptor = Vec::new();
     for token in source.split_whitespace() {
         descriptor.push(u8::from_str_radix(token, 16).map_err(|_| {
@@ -336,6 +348,10 @@ pub(crate) fn decode_hex_descriptor(source: &str, label: &str) -> io::Result<Vec
         ));
     }
     Ok(descriptor)
+}
+
+pub(crate) fn decode_hex_descriptor(source: &str, label: &str) -> io::Result<Vec<u8>> {
+    decode_hex_blob(source, label)
 }
 
 #[cfg(test)]
@@ -371,6 +387,8 @@ runtime_directory = "/run/test-device"
 type = "functionfs"
 name = "main"
 mount = "/dev/ffs-test-device"
+descriptors_hex = "03 00 00 00 27 00 00 00 01 00 00 00 03 00 00 00 09 04 00 00 02 ff 00 00 00 07 05 01 02 40 00 00 07 05 81 02 40 00 00"
+strings_hex = "02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00"
 "#;
 
     #[test]
@@ -409,7 +427,7 @@ mount = "/dev/ffs-test-device"
     #[test]
     fn rejects_function_environment_collisions() {
         let source = format!(
-            "{VALID}\n[[functions]]\ntype = \"functionfs\"\nname = \"ma-in\"\nmount = \"/dev/ffs-second\"\n\n[[functions]]\ntype = \"hid\"\nname = \"ma_in\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor = \"/usr/share/test.hex\"\ndevice = \"/dev/hidg0\"\n"
+            "{VALID}\n[[functions]]\ntype = \"functionfs\"\nname = \"ma-in\"\nmount = \"/dev/ffs-second\"\ndescriptors_hex = \"03 00 00 00 27 00 00 00 01 00 00 00 03 00 00 00 09 04 00 00 02 ff 00 00 00 07 05 01 02 40 00 00 07 05 81 02 40 00 00\"\nstrings_hex = \"02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00\"\n\n[[functions]]\ntype = \"hid\"\nname = \"ma_in\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor = \"/usr/share/test.hex\"\ndevice = \"/dev/hidg0\"\n"
         );
         let profile: Profile = toml::from_str(&source).unwrap();
         assert!(profile.validate().is_err());

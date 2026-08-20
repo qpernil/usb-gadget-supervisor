@@ -1,6 +1,7 @@
 //! Generic privileged lifecycle supervisor for Linux USB gadget workers.
 
 mod cli;
+mod functionfs;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod profile;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

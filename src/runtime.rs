@@ -1,19 +1,20 @@
 //! Privileged Linux ConfigFS, FunctionFS, UDC, and worker lifecycle.
 
+use crate::functionfs::{self, Direction};
 use crate::profile::{
-    decode_hex_descriptor, FunctionProfile, HidFunction, Profile, ResourceAccess,
+    decode_hex_blob, decode_hex_descriptor, FunctionProfile, HidFunction, Profile, ResourceAccess,
 };
 use crate::protocol::{
-    Message, CONTROL_FD_ENV, FUNCTIONFS_ENV_PREFIX, HID_ENV_PREFIX, PACKET_LENGTH,
-    RESOURCE_FD_ENV_PREFIX, RUNTIME_DIRECTORY_ENV, STATE_DIRECTORY_ENV,
+    Message, CONTROL_FD_ENV, PACKET_LENGTH, RESOURCE_FD_ENV_PREFIX, RUNTIME_DIRECTORY_ENV,
+    STATE_DIRECTORY_ENV,
 };
 use crate::STOP_REQUESTED;
 use std::ffi::{c_void, CString};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{chown, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{chown, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,7 @@ pub(crate) struct Runtime {
     worker: Option<Child>,
     control: Option<UnixStream>,
     udc: Option<String>,
+    incarnation: u64,
     cleaned: bool,
 }
 
@@ -83,73 +85,50 @@ impl Runtime {
             mounted_functionfs: Vec::new(),
             worker: None,
             control: None,
-            udc: None,
+            udc: Some(select_udc(requested_udc)?),
+            incarnation: 0,
             cleaned: false,
         };
 
         runtime.cleanup_stale_state()?;
-        fs::create_dir(&runtime.gadget)?;
-        runtime.owns_gadget = true;
-        runtime.populate_gadget()?;
-        runtime.prepare_worker_directories()?;
-        runtime.mount_functionfs()?;
-        runtime.spawn_worker()?;
-        runtime.link_functions()?;
-        let udc = select_udc(requested_udc)?;
-        write_attribute(&runtime.gadget.join("UDC"), &udc)?;
-        runtime.udc = Some(udc.clone());
-        runtime.prepare_hid_devices()?;
-        runtime.send(Message::UsbAttached)?;
-        if let Some(control) = runtime.control.as_ref() {
-            control.set_read_timeout(Some(Duration::from_millis(100)))?;
-        }
-
-        println!(
-            "USB gadget profile {} attached through UDC {} as {:04x}:{:04x}; worker is user {}",
-            runtime.profile.name,
-            udc,
-            runtime.profile.usb.vendor_id,
-            runtime.profile.usb.product_id,
-            runtime.identity.name,
-        );
+        runtime.start_incarnation()?;
         Ok(runtime)
     }
 
     pub(crate) fn serve(&mut self) -> io::Result<()> {
         while !STOP_REQUESTED.load(Ordering::Relaxed) {
-            if let Some(status) = self
-                .worker
-                .as_mut()
-                .expect("worker exists after setup")
-                .try_wait()?
-            {
-                return Err(io::Error::other(format!(
-                    "device worker exited unexpectedly with {status}"
-                )));
+            let mut restart_reason = None;
+            if let Some(status) = self.worker.as_mut().expect("worker exists").try_wait()? {
+                restart_reason = Some(format!("worker exited with {status}"));
             }
-
-            match self.receive() {
-                Ok(Message::ReconnectRequest) => self.reconnect()?,
-                Ok(Message::Fatal) => {
-                    return Err(io::Error::other("device worker reported a fatal error"));
+            if restart_reason.is_none() {
+                match self.receive() {
+                    Ok((message, count)) => {
+                        restart_reason = Some(format!(
+                            "unexpected runtime control message {message:?} with {count} descriptors"
+                        ));
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => restart_reason = Some(format!("control channel ended: {error}")),
                 }
-                Ok(Message::Stopped) => {
-                    return Err(io::Error::other("device worker stopped unexpectedly"));
+            }
+            if let Some(reason) = restart_reason {
+                eprintln!(
+                    "usb-gadget-supervisor: incarnation {} ended ({reason}); rebuilding",
+                    self.incarnation
+                );
+                self.cleanup_incarnation()?;
+                if STOP_REQUESTED.load(Ordering::Relaxed) {
+                    break;
                 }
-                Ok(message) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected worker message while attached: {message:?}"),
-                    ));
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::Interrupted
-                    ) => {}
-                Err(error) => return Err(error),
+                thread::sleep(Duration::from_millis(250));
+                self.start_incarnation()?;
             }
         }
         Ok(())
@@ -160,16 +139,66 @@ impl Runtime {
             return Ok(());
         }
 
+        let mut first_error = self.cleanup_incarnation().err();
+        if self.configfs_mounted_by_us {
+            record_error(
+                &mut first_error,
+                unmount_filesystem(Path::new(CONFIGFS), "configfs").map(|_| ()),
+            );
+            self.configfs_mounted_by_us = false;
+        }
+
+        self.cleaned = true;
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn start_incarnation(&mut self) -> io::Result<()> {
+        self.incarnation += 1;
+        println!(
+            "usb-gadget-supervisor: starting worker incarnation {} for profile {}",
+            self.incarnation, self.profile.name
+        );
+        fs::create_dir(&self.gadget)?;
+        self.owns_gadget = true;
+        self.populate_gadget()?;
+        self.prepare_worker_directories()?;
+        self.mount_functionfs()?;
+        let prebind = self.publish_and_open_functionfs()?;
+        self.spawn_worker(&prebind)?;
+        drop(prebind);
+        self.link_functions()?;
+        let udc = self.udc.clone().expect("UDC selected during setup");
+        write_attribute(&self.gadget.join("UDC"), &udc)?;
+        let postbind = self.open_hid_devices()?;
+        self.send_files(Message::PostbindResources, &postbind)?;
+        drop(postbind);
+        self.expect(Message::Serving)?;
+        self.control
+            .as_ref()
+            .expect("control channel exists")
+            .set_read_timeout(Some(Duration::from_millis(100)))?;
+        println!(
+            "USB gadget profile {} attached through UDC {} as {:04x}:{:04x}; incarnation {} is serving as user {}",
+            self.profile.name,
+            udc,
+            self.profile.usb.vendor_id,
+            self.profile.usb.product_id,
+            self.incarnation,
+            self.identity.name,
+        );
+        Ok(())
+    }
+
+    fn cleanup_incarnation(&mut self) -> io::Result<()> {
         let mut first_error = None;
         if self.owns_gadget {
             record_error(&mut first_error, self.unbind());
         }
-        if self.control.is_some() {
-            record_error(&mut first_error, self.send(Message::Shutdown));
-        }
-        record_error(&mut first_error, stop_worker(&mut self.worker));
         self.control = None;
-
+        record_error(&mut first_error, stop_worker(&mut self.worker));
         for mount in self.mounted_functionfs.iter().rev() {
             record_error(
                 &mut first_error,
@@ -177,7 +206,6 @@ impl Runtime {
             );
         }
         self.mounted_functionfs.clear();
-
         if self.owns_gadget {
             record_error(&mut first_error, self.remove_gadget_tree());
             self.owns_gadget = false;
@@ -191,15 +219,12 @@ impl Runtime {
             &mut first_error,
             remove_dir_if_exists(&self.profile.worker.runtime_directory),
         );
-        if self.configfs_mounted_by_us {
-            record_error(
-                &mut first_error,
-                unmount_filesystem(Path::new(CONFIGFS), "configfs").map(|_| ()),
+        if self.incarnation != 0 {
+            println!(
+                "usb-gadget-supervisor: worker incarnation {} cleaned up",
+                self.incarnation
             );
-            self.configfs_mounted_by_us = false;
         }
-
-        self.cleaned = true;
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -308,18 +333,70 @@ impl Runtime {
         for function in &self.profile.functions {
             if let FunctionProfile::Functionfs(ffs) = function {
                 fs::create_dir_all(&ffs.mount)?;
-                let options = format!(
-                    "uid={},gid={},rmode=0500,fmode=0600",
-                    self.identity.uid, self.identity.gid
-                );
-                mount_filesystem(&ffs.name, &ffs.mount, "functionfs", Some(&options))?;
+                let options = "uid=0,gid=0,rmode=0500,fmode=0600";
+                mount_filesystem(&ffs.name, &ffs.mount, "functionfs", Some(options))?;
                 self.mounted_functionfs.push(ffs.mount.clone());
             }
         }
         Ok(())
     }
 
-    fn spawn_worker(&mut self) -> io::Result<()> {
+    fn publish_and_open_functionfs(&self) -> io::Result<Vec<File>> {
+        let mut files = Vec::new();
+        for function in &self.profile.functions {
+            let FunctionProfile::Functionfs(ffs) = function else {
+                continue;
+            };
+            let descriptors = decode_hex_blob(
+                &ffs.descriptors_hex,
+                &format!("FunctionFS {} descriptors", ffs.name),
+            )?;
+            let strings = decode_hex_blob(
+                &ffs.strings_hex,
+                &format!("FunctionFS {} strings", ffs.name),
+            )?;
+            let endpoints = functionfs::inspect(&descriptors, &strings)?;
+            let mut ep0 = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(ffs.mount.join("ep0"))?;
+            ep0.write_all(&descriptors)?;
+            ep0.write_all(&strings)?;
+            files.push(ep0);
+            for (index, endpoint) in endpoints.iter().enumerate() {
+                let path = ffs.mount.join(format!("ep{}", index + 1));
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "FunctionFS endpoint {} must not be a symlink",
+                            path.display()
+                        ),
+                    ));
+                }
+                let mut options = OpenOptions::new();
+                match endpoint.direction {
+                    Direction::Out => {
+                        options.read(true);
+                    }
+                    Direction::In => {
+                        options.write(true);
+                    }
+                }
+                files.push(options.custom_flags(libc::O_NONBLOCK).open(path)?);
+            }
+            println!(
+                "usb-gadget-supervisor: published FunctionFS {} with {} data endpoints",
+                ffs.name,
+                endpoints.len()
+            );
+        }
+        Ok(files)
+    }
+
+    fn spawn_worker(&mut self, prebind: &[File]) -> io::Result<()> {
         let resources = self.open_resources()?;
         let (mut supervisor, worker_control) = seqpacket_pair()?;
         supervisor.set_read_timeout(Some(Duration::from_millis(
@@ -347,25 +424,6 @@ impl Runtime {
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        for function in &self.profile.functions {
-            match function {
-                FunctionProfile::Functionfs(ffs) => {
-                    command.env(
-                        format!(
-                            "{FUNCTIONFS_ENV_PREFIX}{}",
-                            Profile::function_key(&ffs.name)
-                        ),
-                        &ffs.mount,
-                    );
-                }
-                FunctionProfile::Hid(hid) => {
-                    command.env(
-                        format!("{HID_ENV_PREFIX}{}", Profile::function_key(&hid.name)),
-                        &hid.device,
-                    );
-                }
-            }
-        }
         for (key, file) in &resources {
             command.env(
                 format!("{RESOURCE_FD_ENV_PREFIX}{key}_FD"),
@@ -404,18 +462,9 @@ impl Runtime {
 
         let mut child = command.spawn()?;
         drop(worker_control);
-        if let Err(error) = send_message(&mut supervisor, Message::ResourcesReady)
-            .and_then(|_| receive_message(&mut supervisor))
-            .and_then(|message| {
-                if message == Message::FunctionFsReady {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("worker sent {message:?} instead of FUNCTIONFS_READY"),
-                    ))
-                }
-            })
+        if let Err(error) =
+            send_message_with_files(&mut supervisor, Message::PrebindResources, prebind)
+                .and_then(|_| expect_message(&mut supervisor, Message::Prepared))
         {
             let _ = terminate_child(&mut child);
             return Err(io::Error::new(
@@ -512,42 +561,42 @@ impl Runtime {
         Ok(())
     }
 
-    fn prepare_hid_devices(&self) -> io::Result<()> {
+    fn open_hid_devices(&self) -> io::Result<Vec<File>> {
+        let mut opened = Vec::new();
         for function in &self.profile.functions {
             if let FunctionProfile::Hid(hid) = function {
-                prepare_device(
-                    &hid.device,
-                    self.identity.uid,
-                    self.identity.gid,
-                    Duration::from_secs(5),
-                )?;
+                wait_for_device(&hid.device, Duration::from_secs(5))?;
+                opened.push(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&hid.device)?,
+                );
             }
         }
-        Ok(())
+        Ok(opened)
     }
 
-    fn reconnect(&mut self) -> io::Result<()> {
-        self.unbind()?;
-        self.send(Message::UsbDetached)?;
-        let udc = self
-            .udc
-            .clone()
-            .ok_or_else(|| io::Error::other("cannot reconnect before UDC selection"))?;
-        write_attribute(&self.gadget.join("UDC"), &udc)?;
-        self.prepare_hid_devices()?;
-        self.send(Message::UsbAttached)
-    }
-
-    fn send(&mut self, message: Message) -> io::Result<()> {
-        send_message(
+    fn send_files(&mut self, message: Message, files: &[File]) -> io::Result<()> {
+        send_message_with_files(
             self.control.as_mut().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "worker channel closed")
             })?,
             message,
+            files,
         )
     }
 
-    fn receive(&mut self) -> io::Result<Message> {
+    fn expect(&mut self, expected: Message) -> io::Result<()> {
+        expect_message(
+            self.control.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "worker channel closed")
+            })?,
+            expected,
+        )
+    }
+
+    fn receive(&mut self) -> io::Result<(Message, u16)> {
         receive_message(
             self.control.as_mut().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "worker channel closed")
@@ -789,13 +838,23 @@ fn prepare_owned_directory(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-fn prepare_device(path: &Path, uid: u32, gid: u32, timeout: Duration) -> io::Result<()> {
+fn wait_for_device(path: &Path, timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        if path.exists() {
-            chown(path, Some(uid), Some(gid))?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-            return Ok(());
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.file_type().is_char_device() && !metadata.file_type().is_symlink() =>
+            {
+                return Ok(());
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not a non-symlink character device", path.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -842,16 +901,54 @@ fn seqpacket_pair() -> io::Result<(UnixStream, UnixStream)> {
     })
 }
 
-fn send_message(channel: &mut UnixStream, message: Message) -> io::Result<()> {
-    let packet = message.encode();
-    let length = unsafe {
-        libc::send(
-            channel.as_raw_fd(),
-            packet.as_ptr().cast::<c_void>(),
-            packet.len(),
-            0,
+fn send_message_with_files(
+    channel: &mut UnixStream,
+    message: Message,
+    files: &[File],
+) -> io::Result<()> {
+    let descriptor_count = u16::try_from(files.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many descriptors for one worker-control packet",
         )
+    })?;
+    let packet = message.encode(descriptor_count);
+    let mut iovec = libc::iovec {
+        iov_base: packet.as_ptr().cast::<c_void>().cast_mut(),
+        iov_len: packet.len(),
     };
+    let raw_descriptors = files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+    let control_length = if raw_descriptors.is_empty() {
+        0
+    } else {
+        unsafe {
+            libc::CMSG_SPACE(
+                (raw_descriptors.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint,
+            ) as usize
+        }
+    };
+    let mut control = vec![0_u8; control_length];
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &mut iovec;
+    header.msg_iovlen = 1;
+    if !control.is_empty() {
+        header.msg_control = control.as_mut_ptr().cast::<c_void>();
+        header.msg_controllen = control.len();
+        unsafe {
+            let ancillary = libc::CMSG_FIRSTHDR(&header);
+            (*ancillary).cmsg_level = libc::SOL_SOCKET;
+            (*ancillary).cmsg_type = libc::SCM_RIGHTS;
+            (*ancillary).cmsg_len = libc::CMSG_LEN(
+                (raw_descriptors.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint,
+            ) as usize;
+            std::ptr::copy_nonoverlapping(
+                raw_descriptors.as_ptr(),
+                libc::CMSG_DATA(ancillary).cast::<libc::c_int>(),
+                raw_descriptors.len(),
+            );
+        }
+    }
+    let length = unsafe { libc::sendmsg(channel.as_raw_fd(), &header, libc::MSG_NOSIGNAL) };
     if length < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -864,7 +961,7 @@ fn send_message(channel: &mut UnixStream, message: Message) -> io::Result<()> {
     Ok(())
 }
 
-fn receive_message(channel: &mut UnixStream) -> io::Result<Message> {
+fn receive_message(channel: &mut UnixStream) -> io::Result<(Message, u16)> {
     let mut record = [0_u8; PACKET_LENGTH + 1];
     let length = unsafe {
         libc::recv(
@@ -890,6 +987,19 @@ fn receive_message(channel: &mut UnixStream) -> io::Result<Message> {
         ));
     }
     Message::decode(record[..PACKET_LENGTH].try_into().unwrap())
+}
+
+fn expect_message(channel: &mut UnixStream, expected: Message) -> io::Result<()> {
+    let (message, descriptor_count) = receive_message(channel)?;
+    if message != expected || descriptor_count != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "worker sent {message:?} with {descriptor_count} descriptors instead of {expected:?}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn stop_worker(worker: &mut Option<Child>) -> io::Result<()> {

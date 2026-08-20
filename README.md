@@ -36,9 +36,10 @@ is an intentional USB disconnect followed by re-enumeration with a different
 device identity. Combining unrelated devices behind one composite VID/PID is
 not a compatibility goal.
 
-Endpoint data is never proxied through the supervisor. A worker publishes its
-FunctionFS descriptors and reads and writes FunctionFS endpoint files directly.
-The supervisor retains control only over gadget configuration and lifecycle.
+Endpoint data is never proxied through the supervisor. The supervisor validates
+and publishes profile-owned FunctionFS descriptors, then transfers the open
+endpoint files to the worker. The supervisor retains control only over gadget
+configuration and lifecycle.
 
 ## Project boundaries
 
@@ -152,8 +153,9 @@ Profiles can be schema-checked without root or USB hardware:
 ```
 
 The selected worker receives a private `AF_UNIX/SOCK_SEQPACKET` control socket,
-state/runtime directory paths, named FunctionFS/HID resources, and any
-profile-approved local-hardware file descriptors in its environment. This lets
+state/runtime directory paths, exact USB file-descriptor bundles transferred
+with `SCM_RIGHTS`, and any profile-approved local-hardware file descriptors.
+FunctionFS and HID paths are never exposed to the worker. This lets
 I2C and GPIO device nodes remain root-only while display and button semantics
 stay entirely inside the device worker. See the
 [worker protocol](docs/worker-protocol.md) for the exact contract.
@@ -164,30 +166,16 @@ stay entirely inside the device worker. See the
 - [Worker protocol](docs/worker-protocol.md)
 - [Profile format](docs/profile-format.md)
 - [Trezor One worker](docs/trezor-one.md)
-- [Migration from Virtual YubiKey](docs/migration.md)
 - [Raspberry Pi validation](docs/raspberry-pi-validation.md)
 
 ## Status
 
-The initial Rust implementation and the dedicated `virtual-yubikey-worker`
-migration are complete in source. Profile parsing is strict, the lifecycle
-protocol has a fixed revision-1 wire encoding, and both repositories pass unit
-tests and Linux-target compilation.
-
-The extracted supervisor and Virtual YubiKey worker were deployed together on
-an aarch64 Raspberry Pi on 2026-08-17. The Pi reached UDC state `configured`,
-macOS enumerated `1050:0406`, existing PIV state loaded, worker-crash cleanup and
-systemd recovery passed, the exclusive UDC lock rejected a second instance, and
-host `ykman`/`yubico-piv-tool` read Management, FIDO2, and preserved PIV status.
-Full host-level FIDO registration/assertion and PIV mutation regression tests
-remain before the migration is considered a release. The first implementation
-still prepares configured `/dev/hidgN` paths
-by ownership after UDC bind; passing HID descriptors with `SCM_RIGHTS` remains a
-planned hardening step. The second worker will be the Trezor One port, which
-will test whether the current abstractions are genuinely generic before the API
-is declared stable.
-
-See [migration.md](docs/migration.md) for the proposed delivery sequence.
+The supervisor, Virtual YubiKey worker, and Virtual Trezor worker implement the
+same fixed version-1 resource protocol and schema-1 profiles. Profile parsing is
+strict, FunctionFS resources are derived from installed descriptor blobs, and
+USB FDs are passed with `SCM_RIGHTS`. Unit tests and Raspberry Pi-targeted Rust
+type checks pass. Run the hardware checklist before treating a profile as
+deployable.
 
 ## Contributing
 

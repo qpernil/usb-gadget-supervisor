@@ -1,161 +1,142 @@
 # Worker Protocol
 
-## Goals
+## Purpose
 
-The worker protocol coordinates gadget lifecycle without carrying ordinary USB
-payloads. It needs to be small enough for C and Rust workers, deterministic at
-startup, and capable of failing closed.
+The worker protocol gives an unprivileged device worker an immutable set of already-open
+USB resources. The worker never opens FunctionFS mounts, `/dev/hidgN`, ConfigFS,
+or the UDC attribute. Normal USB payloads travel through the transferred file
+descriptors, not through the control socket.
 
-The transport is an inherited local `AF_UNIX` `SOCK_SEQPACKET` descriptor. It is
-not stdin or stdout: those remain available for normal process behavior and
-diagnostics. Packet boundaries make the protocol unambiguous without a streaming
-decoder.
+Supervisor, profile, and worker are deployed as one matched set.
 
-Revision 1 is implemented by both `usb-gadget-supervisor` and
-`virtual-yubikey-worker`. Its semantics remain alpha until the Trezor worker has
-also exercised it, but its byte fixture is explicit and tested in both
-repositories.
+## Transport and encoding
 
-## Revision 1 encoding
-
-Every `SOCK_SEQPACKET` record is exactly eight bytes:
+The supervisor creates a local `AF_UNIX` `SOCK_SEQPACKET` socket pair. One end
+is inherited by the worker as `USB_GADGET_CONTROL_FD`. Packet boundaries remove
+the need for a stream decoder, and `SCM_RIGHTS` ancillary data carries open file
+descriptions independently of the eight-byte normal-data record.
 
 | Offset | Size | Meaning |
 | --- | --- | --- |
 | 0 | 4 | ASCII magic `UGSP` |
-| 4 | 1 | Protocol version, currently `1` |
+| 4 | 1 | Protocol version `1` |
 | 5 | 1 | Message type |
-| 6 | 2 | Big-endian flags, currently zero |
+| 6 | 2 | Big-endian exact count of attached file descriptors |
 
-Message type values are `0x01`–`0x04` for supervisor messages and
-`0x81`–`0x84` for worker messages, in the order shown below. Unknown versions,
-types, flags, truncated records, and EOF fail closed.
-
-## Startup
-
-1. The supervisor validates the profile, creates the unbound ConfigFS gadget,
-   mounts FunctionFS, and prepares the runtime directory.
-2. It opens every available profile-declared local character device, creates a
-   `SOCK_SEQPACKET` pair, and starts the worker with those descriptors inherited.
-   Descriptor numbers are supplied through the environment.
-3. Before `exec`, the supervisor clears supplementary groups, sets the target
-   GID and UID, enables `PR_SET_NO_NEW_PRIVS`, and installs a parent-death
-   signal.
-4. The supervisor sends `RESOURCES_READY`. The worker opens FunctionFS `ep0`,
-   writes its descriptors and strings, and opens the data endpoints required
-   before attachment.
-5. The worker sends `FUNCTIONFS_READY`.
-6. The supervisor links profile functions in deterministic order, binds the UDC,
-   and prepares post-bind nodes such as `/dev/hidgN`.
-7. The supervisor sends `USB_ATTACHED`, optionally with file descriptors using
-   `SCM_RIGHTS`.
-8. The worker begins its endpoint service loops.
+The count is part of the validation contract. Truncated packets, ancillary
+truncation, unexpected ancillary types, unknown messages, wrong counts, and EOF
+during startup fail closed.
 
 ## Messages
 
-### Supervisor to worker
+| Direction | Message | Value | FD count |
+| --- | --- | ---: | ---: |
+| Supervisor → worker | `PREBIND_RESOURCES` | `0x01` | Profile-derived |
+| Supervisor → worker | `POSTBIND_RESOURCES` | `0x02` | Profile-derived |
+| Worker → supervisor | `PREPARED` | `0x81` | 0 |
+| Worker → supervisor | `SERVING` | `0x82` | 0 |
 
-| Message | Meaning |
-| --- | --- |
-| `RESOURCES_READY` | Pre-bind paths and inherited resources are available; optional when entirely supplied at exec |
-| `USB_ATTACHED` | UDC is bound and post-bind resources are usable |
-| `USB_DETACHED` | UDC has been unbound for reconnect or shutdown |
-| `SHUTDOWN` | Stop accepting work, flush safe state, and exit promptly |
+There are no shutdown, detach, fatal, stopped, or reconnect messages. After
+`SERVING`, the socket remains open only as a liveness relationship:
 
-### Worker to supervisor
+- supervisor EOF tells the worker to exit;
+- worker EOF or process exit tells the supervisor to rebuild the incarnation;
+- a firmware `usbReconnect()` operation ends the worker process, producing the
+  same clean rebuild as any other worker exit.
 
-| Message | Meaning |
-| --- | --- |
-| `FUNCTIONFS_READY` | FunctionFS descriptors are published and required endpoints are open |
-| `RECONNECT_REQUEST` | Perform a controlled UDC unbind/rebind cycle |
-| `STOPPED` | Graceful shutdown is complete |
-| `FATAL` | Worker cannot continue; supervisor must unbind and tear down |
+## Fixed resource order
 
-The current message values are:
+The magic/version selects one fixed layout. No per-descriptor identifiers or
+nullable slots are encoded. Optional resources, if a future profile needs any,
+must use a separate explicitly versioned message rather than changing the
+meaning of an existing slot.
 
-| Message | Value |
-| --- | --- |
-| `RESOURCES_READY` | `0x01` |
-| `USB_ATTACHED` | `0x02` |
-| `USB_DETACHED` | `0x03` |
-| `SHUTDOWN` | `0x04` |
-| `FUNCTIONFS_READY` | `0x81` |
-| `RECONNECT_REQUEST` | `0x82` |
-| `STOPPED` | `0x83` |
-| `FATAL` | `0x84` |
+`PREBIND_RESOURCES` contains, in profile function order:
 
-## Inherited environment
+1. for every FunctionFS function, its `ep0` descriptor;
+2. immediately after it, `ep1` through `epN` in descriptor declaration order.
 
-The supervisor clears the worker environment, then supplies only its resource
-contract:
+The supervisor parses the FunctionFS v2 descriptor blob to derive `N`, endpoint
+order, direction, and therefore the safe open mode. The worker and its installed
+profile are one versioned device contract, so the worker knows the semantic
+meaning of each position.
+
+`POSTBIND_RESOURCES` contains one open HID gadget descriptor for every ConfigFS
+HID function, again in profile order. HID nodes exist only after UDC binding,
+which is why this second transfer is necessary.
+
+Current layouts are:
+
+| Worker | Pre-bind FDs | Post-bind FDs |
+| --- | --- | --- |
+| Virtual YubiKey | CCID `ep0`, bulk OUT, bulk IN, interrupt IN | FIDO HID |
+| Virtual Trezor | main `ep0`, OUT, IN | none |
+
+Profile-declared non-USB character devices such as I2C, SPI, and GPIO remain
+opened before credential drop and inherited at `exec`. Their decimal descriptor
+numbers use `USB_GADGET_RESOURCE_<NAME>_FD`. They have the same important
+property: the worker receives authority to an open resource and does not gain
+permission to open its path.
+
+## Startup sequence
+
+1. The supervisor validates the root-owned schema-1 profile and FunctionFS
+   blobs.
+2. It creates the unbound ConfigFS gadget and root-only FunctionFS mounts.
+3. It writes each function's descriptors and strings to `ep0`.
+4. It opens every resulting endpoint with direction-appropriate access.
+5. It starts the unprivileged worker and sends `PREBIND_RESOURCES` with
+   `SCM_RIGHTS`.
+6. The worker validates the exact layout, initializes state, and sends
+   `PREPARED`.
+7. The supervisor links functions and binds the selected UDC.
+8. It opens post-bind HID nodes and sends `POSTBIND_RESOURCES` (including an
+   explicit zero-FD packet when there are none).
+9. The worker sends `SERVING` and begins its transport loops.
+
+The worker retains FunctionFS `ep0` because it still receives runtime
+`BIND`, `ENABLE`, `DISABLE`, `UNBIND`, `SUSPEND`, `RESUME`, and `SETUP` events.
+It does not use `ep0` to publish descriptors; that setup operation is already
+complete before the FD is transferred.
+
+## Incarnations and cleanup
+
+The supervisor process owns the long-lived service. A worker process is one
+short-lived incarnation with an immutable resource bundle:
+
+```text
+prepare -> worker PREPARED -> bind -> worker SERVING -> serving
+   ^                                                |
+   +------ unbind, clean, create new process <------+ worker exit/EOF
+```
+
+On worker exit or control EOF, the supervisor unbinds first, closes its control
+socket, waits briefly for worker termination, unmounts FunctionFS, removes the
+ConfigFS gadget, and constructs a fresh incarnation. A systemd stop performs
+the same incarnation cleanup and then ends the supervisor service. This uses
+process creation as the complete reset boundary instead of trying to repair
+endpoint state inside an old process.
+
+## Environment
+
+The supervisor clears the environment and supplies only:
 
 | Variable | Meaning |
 | --- | --- |
-| `USB_GADGET_CONTROL_FD` | Decimal inherited control descriptor |
-| `USB_GADGET_STATE_DIRECTORY` | Profile-owned persistent state directory |
+| `USB_GADGET_CONTROL_FD` | Inherited control socket descriptor |
+| `USB_GADGET_STATE_DIRECTORY` | Persistent worker-owned state directory |
 | `USB_GADGET_RUNTIME_DIRECTORY` | Volatile worker runtime directory |
-| `USB_GADGET_FUNCTIONFS_<NAME>` | Named FunctionFS mount path |
-| `USB_GADGET_HID_<NAME>` | Named ConfigFS HID device path |
-| `USB_GADGET_RESOURCE_<NAME>_FD` | Decimal inherited descriptor for a profile-declared local character device |
+| `USB_GADGET_RESOURCE_<NAME>_FD` | Approved inherited local hardware descriptor |
 
-Function and resource names are uppercased and non-alphanumeric characters
-become `_`. For example, `display-i2c` becomes
-`USB_GADGET_RESOURCE_DISPLAY_I2C_FD`. An unavailable optional resource has no
-environment variable. A C worker can consume the same environment and fixed
-structure without a Rust dependency.
-
-The supervisor opens declared resources before `setgroups`, `setgid`, and
-`setuid`, then clears `FD_CLOEXEC` only for the approved descriptors. Device
-nodes may therefore remain root-only and the worker needs no supplementary
-`i2c` or `gpio` group. The supervisor neither issues I2C/GPIO ioctls nor knows
-display addresses, GPIO offsets, button meanings, or framebuffer formats.
-
-Descriptor confinement is at device-node granularity. An inherited I2C bus
-descriptor may address other devices on that bus, and an inherited GPIO-chip
-descriptor may request other lines on that chip. Profiles should expose the
-narrowest suitable device nodes, and workers must still constrain addresses
-and lines internally.
+There are no FunctionFS or HID path environment variables.
 
 ## Data path
 
-USB traffic does not use the control channel:
-
 ```text
-host OUT transfer -> FunctionFS endpoint file -> worker
-host IN transfer  <- FunctionFS endpoint file <- worker
+host OUT -> UDC/kernel -> open OUT fd -> worker protocol decoder
+host IN  <- UDC/kernel <- open IN fd  <- worker protocol encoder
 ```
 
-ConfigFS HID functions may expose `/dev/hidgN` only after UDC bind. A future
-revision can open the node and pass the descriptor with `USB_ATTACHED`, avoiding
-global `chown` and device-number races. Revision 1 retains the migration path:
-the profile declares `/dev/hidgN`, the supervisor changes that node's ownership
-after bind, and the worker opens the inherited path after `USB_ATTACHED`.
-
-## Reconnect
-
-Some firmware APIs expose a logical USB reconnect. The worker sends
-`RECONNECT_REQUEST`; it never writes the UDC attribute itself.
-
-The supervisor:
-
-1. Unbinds the UDC.
-2. Sends `USB_DETACHED`.
-3. Waits for endpoints to settle if required by the kernel driver.
-4. Rebinds the same validated gadget.
-5. Sends `USB_ATTACHED` with any replaced descriptors.
-
-Changing to a different device profile is not a reconnect message. It is a full
-worker stop and gadget reconstruction.
-
-## Failure behavior
-
-- Startup has a bounded readiness timeout.
-- EOF, malformed messages, or worker exit while attached trigger immediate UDC
-  unbind.
-- The supervisor does not blindly restart a worker while stale endpoints remain
-  bound.
-- Cleanup runs in reverse ownership order and preserves the first material
-  error for diagnostics.
-- Sensitive USB payloads are never included in supervisor logs.
-- Worker trace logging remains a device-project policy and may expose secrets;
-  it is disabled by default.
+The root supervisor is absent from this data path. It handles descriptor
+metadata and lifecycle but never proxies CTAP, CCID, Trezor, or vendor-bulk
+payloads.
