@@ -1,148 +1,72 @@
 # Trezor One Worker
 
-## Target
+## Scope
 
-The pictured and selected device is a Trezor Model One, internally `T1B1`. It
-uses Trezor's legacy C firmware, not the MicroPython/C/Rust Trezor Core stack
-used by Model T and Safe devices.
+The Virtual Trezor worker runs the upstream Trezor One (`T1B1`) legacy C
+firmware logic as a native Linux process. It is not an STM32 emulator and does
+not execute a signed production firmware image. The worker is intended for
+protocol, UI, and integration development; it does not provide the physical
+security, firmware authenticity, or entropy guarantees of a hardware wallet.
 
-The Pi worker is a native Linux port of the upstream firmware sources. It is not
-an STM32 instruction-set emulator and does not execute the signed production
-firmware binary.
+The complete worker implementation, build, deployment, and hardware notes live
+in [`virtual-trezor`](https://github.com/qpernil/virtual-trezor). This page
+defines the boundary relevant to the supervisor.
 
-## Firmware and HAL boundary
+## USB boundary
 
-The upstream legacy firmware owns a static 128 by 64 monochrome framebuffer:
-
-```text
-128 * 64 / 8 = 1024 bytes
-```
-
-The common `legacy/oled.c` code composes every pixel, character, bitmap,
-dialogue, and animation. It exposes `oledGetBuffer()` and calls
-`oledRefresh()` when the completed buffer should become visible.
-
-The upstream Unix emulator supplies `oledInit()` and `oledRefresh()` from
-`legacy/emulator/oled.c`. Current upstream code expands the one-bit framebuffer
-into an SDL3 texture and presents a window. The Pi HAL instead transmits that
-same firmware-owned buffer to an SSD1306 over Linux I2C.
+The profile contains the FunctionFS descriptor and string blobs for the main
+Trezor vendor interface. The supervisor validates those blobs, derives one OUT
+and one IN endpoint, publishes the blobs to FunctionFS, and opens:
 
 ```text
-upstream layout and wallet code
-              |
-              v
-       1024-byte framebuffer
-              |
-          oledRefresh()
-              |
-      /dev/i2c-1 at 0x3c
-              |
-         SSD1306 OLED
+ep0, OUT, IN
 ```
 
-Likewise, common `legacy/buttons.c` owns press, release, and hold behavior. The
-platform supplies only `buttonRead()`. The Pi implementation maps two active-low
-GPIO lines to Trezor's No/Yes bits.
+It transfers the three descriptors to the unprivileged worker in the fixed
+pre-bind resource bundle. The worker reports `PREPARED`, the supervisor binds
+the UDC, and the worker reports `SERVING` after FunctionFS signals that the
+interface is enabled. Normal USB packets then move directly between the host,
+the FunctionFS endpoint descriptors, and the upstream Trezor message decoder;
+the supervisor does not proxy or interpret them.
 
-## Pi HAL
+The current profile exposes only the main vendor interface. DebugLink and the
+separate U2F HID interface are not exposed.
 
-The external library is expected to export the hardware-facing symbols required
-by the firmware build:
+## Display and buttons
 
-```text
-libtrezor-pi-hal.a
-  oled_pi.c
-    oledInit
-    oledRefresh
-    emulatorPoll
+The upstream firmware owns its 128 by 64, 1,024-byte monochrome framebuffer and
+all layout, drawing, animation, and button-state logic. The Linux platform code
+sends that existing framebuffer through supervisor-opened resources and samples
+active-low GPIO buttons.
 
-  buttons_pi.c
-    buttonRead
+Current profiles select one of these display arrangements:
 
-  usb_pi.c
-    usbInit
-    usbPoll
-    usbReconnect
-    usbTiny
-    waitAndProcessUSBRequests
-    usbFlush
+- SH1106 over SPI, with GPIO Data/Command and reset;
+- SSD1306 or SH1106 over I2C at address `0x3c`; or
+- ST7789 over SPI, scaling the unchanged framebuffer into a centered 240 by 120
+  image on a 240 by 240 panel.
 
-  storage_pi.c
-  timer_pi.c
-  rng_pi.c
-  setup_pi.c
-```
+The worker inherits the declared I2C, SPI, and GPIO descriptors across `exec`.
+Their descriptor numbers are named by `USB_GADGET_RESOURCE_<NAME>_FD`
+environment variables. It never opens the corresponding device paths and does
+not need ownership of those device nodes.
 
-The build links this HAL instead of the upstream SDL/UDP emulator objects. The
-common wallet, signing, protocol, UI-layout, framebuffer, and button-state code
-remains upstream.
+An orderly worker exit blanks and powers off the selected display. `SIGKILL`
+cannot run process cleanup; the replacement worker clears the panel during
+display initialization.
 
-## Direct USB
+## Lifecycle
 
-UDP exists in the desktop emulator only because a normal workstation process
-does not own a USB device controller. The Raspberry Pi does, so production Pi
-mode uses real FunctionFS endpoints directly:
+`usbReconnect()` exits the worker. Control-socket EOF tells the still-running
+supervisor to unbind the UDC, remove the complete gadget incarnation, create a
+new worker with fresh descriptors, and bind again. Stopping the supervisor
+service performs the same teardown without starting another incarnation. Only
+the supervisor writes the UDC attribute.
 
-```text
-host OUT transfer -> FunctionFS OUT fd -> usbPoll -> Trezor message decoder
-host IN transfer  <- FunctionFS IN fd  <- msg_out_data
-```
+## Process boundary
 
-The Trezor worker publishes the selected release's main vendor/WebUSB interface,
-optional debug interface, and optional U2F HID interface. The supervisor owns
-ConfigFS and UDC lifecycle but does not proxy ordinary packets.
-
-`usbReconnect()` sends `RECONNECT_REQUEST` over the lifecycle control channel;
-only the supervisor may unbind or rebind the UDC.
-
-## Physical UI
-
-The initial hardware target is:
-
-- Raspberry Pi 4 or Raspberry Pi 5.
-- Adafruit 128x64 OLED Bonnet with SSD1306 at I2C address `0x3c`.
-- Bonnet button A on BCM GPIO 5 mapped to Trezor No/left/cancel.
-- Bonnet button B on BCM GPIO 6 mapped to Trezor Yes/right/confirm.
-- Reliable USB-C gadget power/data arrangement.
-- Active cooling for Raspberry Pi 5.
-
-The Bonnet's joystick is not part of the Trezor interface. It may later select
-an appliance profile before USB attachment or request a controlled shutdown.
-
-The final Trezor worker needs no SDL, X11, Wayland, visible window, UDP socket,
-or reimplemented UI.
-
-## Storage and entropy
-
-The selected upstream emulator storage model is replaced or wrapped with a
-profile-specific file under `/var/lib/virtual-trezor`. The worker owns the file;
-the supervisor prepares only the containing directory and permissions.
-
-Linux `getrandom()` is preferred over the upstream development PRNG, but it
-does not make the resulting appliance equivalent to physical Trezor hardware.
-Storage and seeds remain ordinary software-accessible data on a general-purpose
-computer.
-
-## Process and licensing boundary
-
-The Trezor worker remains a separate executable launched by the supervisor. It
-is not linked into the permissively licensed Rust supervisor or YubiKey worker.
-This preserves upstream build independence, crash isolation, privilege
-separation, and a clearer licensing boundary. Distribution still requires
-normal compliance with all upstream licenses.
-
-## Development sequence
-
-1. Pin an upstream legacy release and build its native emulator on ARM64.
-2. Link a stub Pi HAL without modifying common firmware sources.
-3. Replace SDL OLED output with direct SSD1306 I2C writes.
-4. Replace SDL keyboard input with GPIO button reads.
-5. Publish Trezor FunctionFS descriptors and serve the main endpoints directly.
-6. Connect the worker readiness/reconnect protocol to the supervisor.
-7. Validate enumeration and commands with `trezorctl` and Trezor Suite.
-8. Add optional U2F and debug interfaces only after the main wallet transport is
-   stable.
-
-This worker is for compatibility development and experimentation. It must not
-be represented as providing Trezor's physical extraction resistance, firmware
-authenticity, entropy guarantees, or security certification.
+The Trezor worker remains a separate executable. This preserves crash
+isolation, privilege separation, independent build and licensing boundaries,
+and a narrow capability surface: after privilege drop, the worker can access
+only the open descriptors, state directory, runtime directory, arguments, and
+environment explicitly supplied by the supervisor.

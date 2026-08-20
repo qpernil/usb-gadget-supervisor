@@ -6,10 +6,10 @@ A profile is a declarative, root-owned description of one host-visible USB
 device and its worker. Profiles keep device identities and descriptors in their
 own projects while allowing the supervisor to remain protocol-neutral.
 
-Revision 1 uses TOML because the documents are operator-readable and the schema
+Profiles use TOML because the documents are operator-readable and the schema
 is strictly deserialized with unknown fields rejected.
 
-## Draft structure
+## Example
 
 ```toml
 schema = 1
@@ -24,8 +24,8 @@ max_speed = "full-speed"
 device_class = 0
 device_subclass = 0
 device_protocol = 0
-manufacturer = "Yubico"
-product = "YubiKey FIDO+CCID"
+manufacturer = "Virtual USB Gadget"
+product = "Virtual Yubico YubiKey FIDO+CCID"
 # Omit serial to expose no USB iSerialNumber string.
 max_power_ma = 30
 
@@ -66,10 +66,23 @@ device = "/dev/hidg0"
 type = "functionfs"
 name = "ccid"
 mount = "/dev/ffs-virtual-yubikey"
+descriptors_hex = """
+# Complete USB_FUNCTIONFS_DESCRIPTORS_MAGIC_V2 blob.
+"""
+strings_hex = """
+# Complete USB_FUNCTIONFS_STRINGS_MAGIC blob.
+"""
 ```
 
 Function order is significant because ConfigFS assigns interface numbers in
 link order.
+
+For every FunctionFS entry, `descriptors_hex` and `strings_hex` are required.
+They are the exact byte blobs the supervisor writes to `ep0`. The supervisor
+parses them to validate their structure and derive the ordered endpoint FD
+bundle; endpoint direction determines whether each node is opened for reading
+or writing. Descriptor contents remain versioned with the device project even
+though publication is a supervisor operation.
 
 ## Local hardware resources
 
@@ -86,15 +99,15 @@ in the worker. A future Virtual YubiKey/Trezor OLED profile can therefore share
 root-only `/dev/i2c-1` and a selected `/dev/gpiochipN` without putting either
 worker in broad hardware groups.
 
-## Trezor One sketch
+## Trezor One example
 
-The selected upstream Trezor release remains the source of truth for the exact
-USB identity and descriptors; these illustrative values must be verified when a
-release is pinned.
+Virtual Trezor uses the same schema with one FunctionFS vendor interface. The
+device repository owns the complete descriptor and string blobs; this excerpt
+shows the profile shape without duplicating those byte tables.
 
 ```toml
 schema = 1
-name = "trezor-one"
+name = "virtual-trezor"
 
 [usb]
 vendor_id = 0x1209
@@ -105,15 +118,15 @@ max_speed = "full-speed"
 device_class = 0
 device_subclass = 0
 device_protocol = 0
-manufacturer = "SatoshiLabs"
-product = "TREZOR"
-# The initial schema supports an omitted or static USB serial string.
+manufacturer = "Virtual Trezor"
+product = "Virtual Trezor"
+serial = "virtual-trezor-one"
 max_power_ma = 100
 
 [worker]
-command = "/home/per/virtual-trezor/build/trezor-one-pi"
+command = "/home/per/virtual-trezor/build/virtual-trezor-worker"
 run_as = "per"
-readiness_timeout_ms = 10000
+readiness_timeout_ms = 30000
 state_directory = "/var/lib/virtual-trezor"
 runtime_directory = "/run/virtual-trezor"
 
@@ -121,26 +134,18 @@ runtime_directory = "/run/virtual-trezor"
 type = "functionfs"
 name = "trezor"
 mount = "/dev/ffs-virtual-trezor"
-
-[[functions]]
-type = "hid"
-name = "u2f"
-protocol = 0
-subclass = 0
-report_length = 64
-# Use the exact descriptor bytes from the pinned Trezor firmware release.
-report_descriptor_hex = """
-06 d0 f1 09 01 a1 01 09 20 15 00 26 ff 00 75 08
-95 40 81 02 09 21 15 00 26 ff 00 75 08 95 40 91 02
-c0
+descriptors_hex = """
+# Complete v2 FunctionFS descriptor blob from the device implementation.
 """
-device = "/dev/hidg0"
+strings_hex = """
+# Complete FunctionFS string blob from the device implementation.
+"""
 ```
 
-Whether the main, debug, and U2F interfaces are all published by one FunctionFS
-function or split between FunctionFS and ConfigFS HID will be decided by the
-first hardware spike. The profile schema must support deterministic interface
-ordering either way.
+The current Virtual Trezor profile exposes only the main vendor interface.
+DebugLink and the separate U2F HID interface are not present. Profile order
+remains the deterministic interface order whenever more than one function is
+declared.
 
 ## Validation
 
@@ -153,6 +158,8 @@ The supervisor must reject profiles that violate any of these conditions:
   write bits, writable by a group other than the worker's primary group, or
   without an applicable execute bit.
 - Invalid VID/PID, USB version, endpoint size, power, class, or protocol values.
+- Invalid FunctionFS v2 headers, counts, descriptor lengths, endpoint topology,
+  or string tables.
 - Duplicate function names or mount paths.
 - Duplicate resource names, normalized environment keys, or device paths.
 - Resource paths outside `/dev` or resources that are not character devices.

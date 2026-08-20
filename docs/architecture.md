@@ -1,165 +1,173 @@
 # Architecture
 
-## Purpose
+## Boundary
 
-Linux USB gadget setup requires privileges that device protocol implementations
-should not possess. The supervisor isolates those privileges in a small process
-and gives an unprivileged worker direct access to only the USB and local hardware
-resources required by its selected profile.
-
-The design generalizes the process boundary already present in
-`virtual-yubikey`: a root process configures the gadget and starts a fresh copy
-as an unprivileged protocol worker. The extracted project makes that boundary an
-explicit cross-project contract.
-
-## Process model
+Linux USB gadget construction requires root; USB device protocol handling does
+not. `usb-gadget-supervisor` therefore owns construction, authority, and
+lifecycle, while one unprivileged worker owns protocol behavior, secrets, UI,
+and persistent device state.
 
 ```text
-Host computer
+host computer
      |
-     | USB
+     | physical USB
      v
-Linux UDC
-     |
-     +-- ConfigFS identity and function composition
-     |
-     +-- FunctionFS endpoint files --------------------+
-                                                       |
-                        +------------------------------v--+
-                        | unprivileged device worker      |
-                        |                                 |
-                        | protocol, crypto, state, policy |
-                        +---------------------------------+
-     ^
-     |
-usb-gadget-supervisor
-  - owns the UDC lock
-  - creates and removes ConfigFS objects
-  - mounts FunctionFS with worker ownership
-  - starts, monitors, and stops the worker
-  - binds and unbinds the UDC
+UDC <-> Linux composite gadget
+          |                    |
+          | FunctionFS FDs     | HID gadget FD
+          +----------+---------+
+                     |
+                     v
+            unprivileged worker
+
+root supervisor: profile, ConfigFS, FunctionFS publication/open, UDC, process
+worker: ep0 events, endpoint traffic, protocol, cryptography, policy, UI, state
 ```
 
-The supervisor is not in the endpoint data path. This avoids an unnecessary
-copy, keeps device latency predictable, and prevents the root process from
-handling secrets or attacker-controlled protocol payloads beyond kernel and
-lifecycle metadata.
+The supervisor is not a USB payload proxy. Once construction is complete, the
+kernel moves traffic directly between the host controller and the file
+descriptors held by the worker.
 
-## Ownership
+## Division of responsibility
 
-| Resource | Owner | Rationale |
-| --- | --- | --- |
-| `/sys/kernel/config/usb_gadget/...` | Supervisor | Requires root and controls host-visible identity |
-| UDC bind/unbind | Supervisor | Global lifecycle and crash containment |
-| FunctionFS mount | Supervisor | Requires privilege and correct worker ownership |
-| FunctionFS descriptors | Worker | They are part of the device-specific USB contract |
-| FunctionFS data endpoints | Worker | Direct device protocol path |
-| ConfigFS HID function creation | Supervisor from profile | Requires root; descriptor is supplied by the device project |
-| Device state and private keys | Worker | Must never enter the privileged process |
-| I2C/GPIO UI | Device worker or narrowly passed descriptors | Device-specific, not part of generic USB supervision |
-| Logs | Both, with separate component labels | Lifecycle and protocol diagnostics have different sensitivity |
+| Resource or decision | Owner |
+| --- | --- |
+| Root-owned schema-1 profile | Device project, enforced by supervisor |
+| USB identity and descriptor bytes | Device profile |
+| Descriptor structural validation | Supervisor |
+| ConfigFS objects and function order | Supervisor |
+| FunctionFS mount and descriptor publication | Supervisor |
+| FunctionFS endpoint and HID node opening | Supervisor |
+| UDC discovery, bind, and unbind | Supervisor |
+| Worker credentials and process lifecycle | Supervisor |
+| `ep0` runtime events and class/vendor SETUP handling | Worker |
+| CTAP, CCID, Trezor, or vendor-bulk bytes | Worker |
+| Private keys, wallet state, policy, display, buttons | Worker |
 
-## Lifecycle
+This split keeps descriptor *content* beside the device implementation without
+requiring the device process to open or configure privileged kernel paths.
+
+## Descriptor-driven resources
+
+Each FunctionFS profile entry includes complete v2 descriptor and string blobs.
+Before a worker exists, the supervisor:
+
+1. validates the blob header, total length, speed-set counts, individual USB
+   descriptor lengths, endpoint addresses, endpoint directions, and string
+   table;
+2. requires identical endpoint topology across full/high/super speed sets;
+3. mounts FunctionFS root-only;
+4. writes descriptors and strings to `ep0`;
+5. opens the generated `ep1..epN` files as read-only for OUT endpoints and
+   write-only for IN endpoints.
+
+The kernel remains the final USB semantic validator. The supervisor parser adds
+early diagnostics, derives the exact resource bundle, and prevents a mismatch
+between the profile and the endpoints it hands to a worker.
+
+ConfigFS HID functions are different: their report descriptor is written to
+the ConfigFS function before binding, but `/dev/hidgN` appears only after the
+UDC is bound. Those FDs therefore form a second, post-bind bundle.
+
+## Incarnation state machine
 
 ```text
-Idle
-  |
-  v
 Preparing
-  - acquire exclusive lock
-  - ensure ConfigFS/libcomposite
-  - validate profile
-  - create gadget but do not bind it
-  - mount FunctionFS
-  |
-  v
-AwaitingWorker
-  - drop worker UID/GID and supplementary groups
-  - set no-new-privileges and parent-death signal
-  - start worker with control descriptor
-  - wait for FunctionFS-ready notification
-  |
-  v
+  create ConfigFS gadget
+  mount/publish/open FunctionFS
+       |
+       v
+Awaiting PREPARED
+  start fresh worker
+  transfer pre-bind FDs
+       |
+       v
 Binding
-  - link functions in deterministic interface order
-  - bind selected UDC
-  - prepare any post-bind HID device nodes
-  - notify worker that USB is attached
-  |
-  v
-Running
-  - monitor worker and termination signals
-  - service lifecycle requests such as reconnect
-  |
-  v
-Stopping
-  - unbind UDC first
-  - terminate worker
-  - unmount FunctionFS
-  - remove ConfigFS tree and runtime paths
-  |
-  v
-Idle
+  link functions
+  bind selected UDC
+  open/transfer HID FDs
+       |
+       v
+Serving (after SERVING)
+       |
+       | worker exit or control EOF
+       v
+Cleaning
+  unbind first
+  close socket and reap worker
+  unmount FunctionFS
+  remove gadget
+       |
+       +----> Preparing (new incarnation)
+
+service stop: Cleaning -> supervisor exits
 ```
 
-Any failure after gadget creation follows the same reverse-order cleanup. A
-worker exit while bound is an error: the supervisor unbinds immediately so the
-host never remains connected to a device with no protocol owner.
+There is no lighter reconnect state. A firmware reconnect request is expressed
+by worker exit. A fresh Unix process gives a complete reset of application
+threads, buffers, endpoint state, and received capabilities, while the
+supervisor service and its exclusive UDC lock remain alive.
 
-## Profiles and workers
+The worker receives its USB resources once at startup and never mutates that
+set while serving. FunctionFS `ENABLE`, `DISABLE`, and `UNBIND` events on the
+inherited `ep0` replace redundant attach/detach control messages.
 
-A root-owned profile selects exactly one worker and describes the USB identity,
-configuration, ordered functions, FunctionFS mounts, and runtime account. The
-profile is installed by the device project, not edited by a worker at runtime.
+## UDC discovery
 
-The initial worker types are:
+Linux exposes registered USB Device Controllers as entries in
+`/sys/class/udc`. The supervisor sorts the names and selects the first, or
+requires an exact `--udc NAME` override. More than one may exist with
+`dummy_hcd`, virtualization, custom carrier hardware, or an additional physical
+device controller. One selected UDC exposes one profile at a time.
 
-- `virtual-yubikey-worker`: native Rust FIDO HID and CCID implementation.
-- `trezor-one-pi`: upstream legacy Trezor firmware linked against a Linux/Pi
-  hardware abstraction library.
-- `virtual-yubihsm-worker`: future implementation of the documented YubiHSM 2
-  command and object model.
+Binding is the final write of that name to the gadget's ConfigFS `UDC`
+attribute. Writing an empty value unbinds it and appears to the host as a
+physical disconnect.
 
-The supervisor treats all of them as external commands speaking the same
-lifecycle protocol.
+## Pi 4 and Pi 5
 
-## One UDC, one identity
+The software architecture is the same on Raspberry Pi 4 and 5: DWC2 device
+mode, ConfigFS, FunctionFS, and the USB-C gadget connection. Typical UDC names
+differ (`fe980000.usb` versus `1000480000.usb`), which is why discovery uses
+sysfs instead of a hard-coded name. The Pi 5's ordinary RP1 USB host ports are
+not alternative gadget controllers.
 
-A USB device descriptor has one VID/PID even when it has several interfaces or
-configurations. Consequently, combining YubiKey, Trezor, and YubiHSM interfaces
-into one composite gadget would not faithfully emulate any of the devices.
+I2C target/peripheral support is unrelated. USB gadget mode depends on the USB
+device controller; it does not depend on the SoC exposing an I2C target.
 
-On Raspberry Pi 4 and 5, the USB-C device controller therefore runs one profile
-at a time. Switching profiles requires unbind, cleanup, construction of the new
-profile, and rebind. Hosts correctly observe a physical disconnect and a newly
-attached device.
+## Unix capability model
 
-Multiple simultaneous identities require multiple UDCs or additional physical
-USB-device hardware and are outside the first implementation.
+An open file descriptor is both a channel and a capability. The supervisor can
+open a root-only endpoint or device node, transfer a duplicate with
+`SCM_RIGHTS`, and leave the path inaccessible to the worker. The worker can use
+only the operations allowed by that already-open file description.
 
-## Trust boundary
+macOS also supports Unix-domain `SCM_RIGHTS` descriptor passing, which can be
+tested with a local datagram socket. It does not support the exact Linux
+`AF_UNIX/SOCK_SEQPACKET` transport used here. ConfigFS, FunctionFS, and UDC
+gadget mode are Linux-specific as well.
 
-The supervisor is trusted to configure the kernel gadget correctly, select the
-approved worker binary, and enforce process credentials. It must not parse
-wallet commands, APDUs, CTAP messages, Trezor protobuf messages, PINs, seeds, or
-private-key material.
+Local I2C, SPI, and GPIO descriptors use the same principle, although they are
+currently inherited across `exec` with descriptor numbers in environment
+variables. Device-specific ioctls and policy remain in the worker.
 
-Profiles must be regular root-owned files, must not be writable by the worker,
-and must use a strict schema. Auxiliary descriptor files, when used instead of
-inline descriptor bytes, have the same requirements. Worker executables must
-be absolute regular non-symlink files, owned by root or the configured worker,
-free of set-ID and world write bits, writable by no group other than the
-worker's primary group, and executable by that identity. A
-worker may therefore run directly from its Git build directory: it is executed
-only after supplementary groups, GID, and UID are dropped and
-`PR_SET_NO_NEW_PRIVS` is set. Replacing that worker changes device behavior but
-cannot inject code into the privileged supervisor.
-Profile-declared local hardware is opened by the supervisor before credential
-drop and inherited by descriptor. The worker owns every ioctl, framebuffer,
-button, and UI policy decision; the supervisor is only a narrow descriptor
-broker.
+## Supported worker shapes
 
-Workers remain development-grade software security devices. Process separation
-reduces accidental privilege exposure; it does not provide physical tamper
-resistance, secure-element properties, certification, or side-channel
-hardening.
+| Device | Kernel surface | Worker data plane |
+| --- | --- | --- |
+| Virtual YubiKey | ConfigFS HID plus FunctionFS CCID | FIDO HID FD; CCID OUT/IN/interrupt FDs; CCID `ep0` events |
+| Virtual Trezor | FunctionFS vendor interface | main OUT/IN FDs; `ep0` events |
+| Virtual YubiHSM | FunctionFS vendor bulk interface | bulk OUT/IN FDs; `ep0` events |
+
+HID is not inherently shareable. The host's HID/FIDO stack and CCID/PCSC stack
+bind to separate USB interfaces, so FIDO can remain available while another
+application holds an exclusive CCID session. That independence comes from USB
+interface and host-driver separation, not from special multi-client behavior
+inside `/dev/hidgN`.
+
+## Trust statement
+
+The supervisor is trusted to validate installed metadata, configure the kernel,
+and launch the approved worker identity. It must not parse APDUs, CTAP messages,
+Trezor protobufs, PINs, seeds, or private keys. Process separation reduces
+privilege exposure; it does not make a Raspberry Pi tamper-resistant hardware.

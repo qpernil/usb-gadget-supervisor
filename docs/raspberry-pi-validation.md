@@ -1,8 +1,6 @@
 # Raspberry Pi Validation
 
-This checklist is the remaining acceptance gate for the initial
-`virtual-yubikey` extraction. Run it on the Pi after installing both projects as
-described in the Virtual YubiKey README.
+Run this checklist for each device profile on its target Pi kernel.
 
 ## Preflight
 
@@ -13,9 +11,9 @@ ls /sys/class/udc
 sudo systemctl stop usb-gadget-supervisor@virtual-yubikey.service
 ```
 
-Confirm that no legacy `g_*` gadget module or another ConfigFS gadget owns the
-controller. Preserve `/var/lib/virtual-yubikey` when testing an upgrade so the
-same FIDO and PIV state files are exercised.
+Confirm that no `g_*` gadget module or unrelated ConfigFS gadget owns the
+controller. Preserve the device state directory unless the test explicitly
+requires a factory reset.
 
 ## Start and enumerate
 
@@ -29,56 +27,43 @@ mount | grep ffs-virtual-yubikey
 stat /dev/hidg0
 ```
 
-With a data-capable cable attached, the UDC should reach `configured`. On the
-host, confirm full-speed `1050:0406`, product `YubiKey FIDO+CCID`, no USB serial
-string, FIDO HID as interface 0, and CCID as interface 1. Save `lsusb -v` output
-from before and after migration and compare the device, configuration,
-interface, endpoint, CCID, and HID descriptors.
+With a data-capable cable attached, the selected UDC should reach
+`configured`. For Virtual YubiKey, confirm full-speed `1050:0406`, product
+`Virtual Yubico YubiKey FIDO+CCID`, no USB serial string, FIDO HID as
+interface 0, and
+CCID as interface 1. Capture `lsusb -v` and verify the device, configuration,
+interface, endpoint, CCID, and HID descriptors against the profile.
 
-Exercise the same host-level FIDO registration/assertion, Management, and PIV
-tests used before extraction. Existing files under `/var/lib/virtual-yubikey`
-must load without migration or ownership errors.
+Exercise host-level FIDO registration/assertion, Management, and PIV operations.
+For Virtual Trezor, exercise enumeration and wallet commands with `trezorctl`
+and Trezor Suite.
 
-## Failure containment
+## Resource boundary
 
-While attached, send `SIGKILL` to only the `virtual-yubikey-worker` process. The
-supervisor must notice the exit, unbind the UDC promptly, clean FunctionFS and
-ConfigFS, and let systemd restart a fresh instance. Also verify:
+Inspect the worker process and confirm:
 
-- stopping the service produces a host-visible disconnect;
-- a second supervisor instance fails on the global lifecycle lock;
-- an invalid or group-writable profile is rejected before gadget creation; and
-- restart after an unclean supervisor exit removes only its known gadget tree.
+- it runs as the configured non-root account;
+- it has the control socket and expected USB endpoint/HID FDs;
+- it has no FunctionFS or HID path environment variables;
+- FunctionFS mounts and HID nodes have not been made worker-owned; and
+- optional I2C/SPI/GPIO access exists only through configured inherited FDs.
 
-Do not declare the migration released until descriptor comparison and these
-failure tests pass on the target Pi kernel.
+## Incarnation recovery
 
-## Validation record: 2026-08-17
+While attached, send `SIGKILL` to only the worker. The same supervisor process
+must:
 
-The extracted supervisor and worker were built and installed on
-`raspberrypi-3`, an aarch64 Raspberry Pi running Debian with Raspberry Pi kernel
-`6.18.39+rpt-rpi-v8`. The controller was `fe980000.usb`.
+1. detect worker exit or control EOF;
+2. unbind the UDC promptly;
+3. remove the old FunctionFS and ConfigFS objects;
+4. start a fresh worker incarnation; and
+5. re-enumerate without a systemd service restart.
 
-Passed:
+Also verify:
 
-- profile validation against the installed root-owned profile;
-- root supervisor plus unprivileged `per:per` worker process ownership;
-- FunctionFS mounted at `/dev/ffs-virtual-yubikey`;
-- UDC state `configured` and ConfigFS identity `1050:0406`, BCD `0x0580`;
-- macOS full-speed enumeration as `YubiKey FIDO+CCID`;
-- loading the existing 1,073-byte FIDO and 2,732-byte PIV state files;
-- host `ykman` Management and FIDO2 information queries by serial `12345678`;
-- host CCID activation, PIV selection, and a full `yubico-piv-tool -a status`
-  read of the preserved P-256, Ed25519, X25519, and RSA-2048 slots;
-- rejection of a second supervisor by the global lifecycle lock; and
-- `SIGKILL` of only the worker causing supervisor failure, cleanup, and a clean
-  systemd restart after two seconds with unchanged state-file hashes.
-
-Still required before release:
-
-- capture and compare complete pre/post `lsusb -v` descriptors from a Linux
-  host;
-- complete a host-level FIDO registration/assertion with touch and cancellation;
-- run the state-mutating Yubico PIV regression workflow; and
-- test stop/restart and crash cleanup repeatedly with the future I2C/GPIO UI
-  resources enabled.
+- firmware `usbReconnect()` produces the same fresh-incarnation cycle;
+- stopping the service produces a host-visible disconnect and final teardown;
+- a second supervisor fails on the global UDC lifecycle lock;
+- malformed descriptors and wrong FD counts fail before exposure; and
+- repeated stop/start and worker-crash cycles leave no stale gadget tree or
+  FunctionFS mount.
