@@ -126,6 +126,9 @@ physical disconnect.
 
 ## Pi 4 and Pi 5
 
+The deployment is tested on both 64-bit Ubuntu and 64-bit Raspberry Pi OS.
+The gadget architecture and DWC2 peripheral-mode setup are the same on both.
+
 The software architecture is the same on Raspberry Pi 4 and 5: DWC2 device
 mode, ConfigFS, FunctionFS, and the USB-C gadget connection. Typical UDC names
 differ (`fe980000.usb` versus `1000480000.usb`), which is why discovery uses

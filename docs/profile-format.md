@@ -30,9 +30,9 @@ product = "Virtual Yubico YubiKey FIDO+CCID"
 max_power_ma = 30
 
 [worker]
-command = "/home/per/virtual-yubikey/target/release/virtual-yubikey-worker"
+command = "/absolute/path/to/virtual-yubikey-worker"
 arguments = ["--serial", "12345678", "--log-level", "info"]
-run_as = "per"
+run_as = "worker-account"
 readiness_timeout_ms = 10000
 state_directory = "/var/lib/virtual-yubikey"
 runtime_directory = "/run/virtual-yubikey"
@@ -121,8 +121,8 @@ serial = "virtual-trezor-one"
 max_power_ma = 100
 
 [worker]
-command = "/home/per/virtual-trezor/build/virtual-trezor-worker"
-run_as = "per"
+command = "/absolute/path/to/virtual-trezor-worker"
+run_as = "worker-account"
 readiness_timeout_ms = 30000
 state_directory = "/var/lib/virtual-trezor"
 runtime_directory = "/run/virtual-trezor"

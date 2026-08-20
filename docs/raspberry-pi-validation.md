@@ -1,5 +1,8 @@
 # Raspberry Pi Validation
 
+This checklist is tested on both 64-bit Ubuntu and 64-bit Raspberry Pi OS.
+It does not depend on a named deployment host or login account.
+
 Run this checklist for each device profile on its target Pi kernel.
 
 ## Preflight

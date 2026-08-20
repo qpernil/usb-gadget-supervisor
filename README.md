@@ -8,6 +8,11 @@
 running protocol-compatible USB device workers on a USB Device Controller
 (UDC), especially on Raspberry Pi 4 and Raspberry Pi 5.
 
+Deployment is tested on both 64-bit Ubuntu and 64-bit Raspberry Pi OS. On
+either system, the normal board-specific prerequisite is to enable DWC2 in
+peripheral mode; the supervisor then uses the resulting UDC through ConfigFS
+and FunctionFS.
+
 The supervisor owns only the privileged mechanics of Linux USB gadget mode:
 ConfigFS, FunctionFS mounts, UDC binding, process credentials, lifecycle, and
 cleanup. Device behavior belongs to separate unprivileged workers such as
