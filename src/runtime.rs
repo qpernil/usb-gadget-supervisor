@@ -5,8 +5,7 @@ use crate::profile::{
     decode_hex_blob, decode_hex_descriptor, FunctionProfile, HidFunction, Profile, ResourceAccess,
 };
 use crate::protocol::{
-    Message, CONTROL_FD_ENV, PACKET_LENGTH, RESOURCE_FD_ENV_PREFIX, RUNTIME_DIRECTORY_ENV,
-    STATE_DIRECTORY_ENV,
+    Message, CONTROL_FD, PACKET_LENGTH, RUNTIME_DIRECTORY_ENV, STATE_DIRECTORY_ENV,
 };
 use crate::STOP_REQUESTED;
 use std::ffi::{c_void, CString};
@@ -166,7 +165,8 @@ impl Runtime {
         self.populate_gadget()?;
         self.prepare_worker_directories()?;
         self.mount_functionfs()?;
-        let prebind = self.publish_and_open_functionfs()?;
+        let mut prebind = self.publish_and_open_functionfs()?;
+        prebind.extend(self.open_resources()?);
         self.spawn_worker(&prebind)?;
         drop(prebind);
         self.link_functions()?;
@@ -397,7 +397,6 @@ impl Runtime {
     }
 
     fn spawn_worker(&mut self, prebind: &[File]) -> io::Result<()> {
-        let resources = self.open_resources()?;
         let (mut supervisor, worker_control) = seqpacket_pair()?;
         supervisor.set_read_timeout(Some(Duration::from_millis(
             self.profile.worker.readiness_timeout_ms,
@@ -406,16 +405,11 @@ impl Runtime {
         let parent_pid = std::process::id() as libc::pid_t;
         let uid = self.identity.uid;
         let gid = self.identity.gid;
-        let resource_fds = resources
-            .iter()
-            .map(|(_, file)| file.as_raw_fd())
-            .collect::<Vec<_>>();
 
         let mut command = Command::new(&self.profile.worker.command);
         command
             .args(&self.profile.worker.arguments)
             .env_clear()
-            .env(CONTROL_FD_ENV, control_fd.to_string())
             .env(STATE_DIRECTORY_ENV, &self.profile.worker.state_directory)
             .env(
                 RUNTIME_DIRECTORY_ENV,
@@ -424,22 +418,14 @@ impl Runtime {
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        for (key, file) in &resources {
-            command.env(
-                format!("{RESOURCE_FD_ENV_PREFIX}{key}_FD"),
-                file.as_raw_fd().to_string(),
-            );
-        }
 
         unsafe {
             command.pre_exec(move || {
-                if libc::fcntl(control_fd, libc::F_SETFD, 0) != 0 {
+                if control_fd != CONTROL_FD && libc::dup2(control_fd, CONTROL_FD) < 0 {
                     return Err(io::Error::last_os_error());
                 }
-                for descriptor in &resource_fds {
-                    if libc::fcntl(*descriptor, libc::F_SETFD, 0) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
+                if libc::fcntl(CONTROL_FD, libc::F_SETFD, 0) != 0 {
+                    return Err(io::Error::last_os_error());
                 }
                 if libc::setgroups(0, std::ptr::null()) != 0 {
                     return Err(io::Error::last_os_error());
@@ -478,30 +464,19 @@ impl Runtime {
         Ok(())
     }
 
-    fn open_resources(&self) -> io::Result<Vec<(String, File)>> {
+    fn open_resources(&self) -> io::Result<Vec<File>> {
         let mut opened = Vec::new();
         for resource in &self.profile.resources {
-            let metadata = match fs::symlink_metadata(&resource.path) {
-                Ok(metadata) => metadata,
-                Err(error) if resource.optional && error.kind() == io::ErrorKind::NotFound => {
-                    eprintln!(
-                        "usb-gadget-supervisor: optional resource {} is unavailable at {}",
+            let metadata = fs::symlink_metadata(&resource.path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "inspect resource {} at {}: {error}",
                         resource.name,
                         resource.path.display()
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    return Err(io::Error::new(
-                        error.kind(),
-                        format!(
-                            "inspect resource {} at {}: {error}",
-                            resource.name,
-                            resource.path.display()
-                        ),
-                    ));
-                }
-            };
+                    ),
+                )
+            })?;
             if metadata.file_type().is_symlink() || !metadata.file_type().is_char_device() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -524,25 +499,22 @@ impl Runtime {
                     options.read(true).write(true);
                 }
             }
-            match options.open(&resource.path) {
-                Ok(file) => opened.push((Profile::function_key(&resource.name), file)),
-                Err(error) if resource.optional && error.kind() == io::ErrorKind::NotFound => {
-                    eprintln!(
-                        "usb-gadget-supervisor: optional resource {} disappeared before open",
-                        resource.name
-                    );
-                }
-                Err(error) => {
-                    return Err(io::Error::new(
-                        error.kind(),
-                        format!(
-                            "open resource {} at {}: {error}",
-                            resource.name,
-                            resource.path.display()
-                        ),
-                    ));
-                }
-            }
+            let file = options.open(&resource.path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "open resource {} at {}: {error}",
+                        resource.name,
+                        resource.path.display()
+                    ),
+                )
+            })?;
+            println!(
+                "usb-gadget-supervisor: opened required resource {} at {}",
+                resource.name,
+                resource.path.display()
+            );
+            opened.push(file);
         }
         Ok(opened)
     }

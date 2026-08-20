@@ -147,9 +147,9 @@ tested with a local datagram socket. It does not support the exact Linux
 `AF_UNIX/SOCK_SEQPACKET` transport used here. ConfigFS, FunctionFS, and UDC
 gadget mode are Linux-specific as well.
 
-Local I2C, SPI, and GPIO descriptors use the same principle, although they are
-currently inherited across `exec` with descriptor numbers in environment
-variables. Device-specific ioctls and policy remain in the worker.
+Local I2C, SPI, and GPIO descriptors use the same mechanism: the supervisor
+opens them and appends them to the pre-bind `SCM_RIGHTS` bundle in profile
+order. Device-specific ioctls and policy remain in the worker.
 
 ## Supported worker shapes
 

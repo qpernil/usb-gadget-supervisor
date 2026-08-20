@@ -44,9 +44,10 @@ Inspect the worker process and confirm:
 
 - it runs as the configured non-root account;
 - it has the control socket and expected USB endpoint/HID FDs;
-- it has no FunctionFS or HID path environment variables;
+- it uses fixed descriptor 3 for control and has no descriptor-number or USB
+  path environment variables;
 - FunctionFS mounts and HID nodes have not been made worker-owned; and
-- optional I2C/SPI/GPIO access exists only through configured inherited FDs.
+- required I2C/SPI/GPIO access exists only through the configured pre-bind FDs.
 
 ## Incarnation recovery
 
