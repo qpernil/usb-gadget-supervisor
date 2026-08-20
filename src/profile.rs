@@ -23,8 +23,6 @@ pub(crate) struct ResourceProfile {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
     pub(crate) access: ResourceAccess,
-    #[serde(default)]
-    pub(crate) optional: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -155,18 +153,11 @@ impl Profile {
         }
 
         let mut resource_names = HashSet::new();
-        let mut resource_keys = HashSet::new();
         let mut resource_paths = HashSet::new();
         for resource in &self.resources {
             validate_name("resource", &resource.name)?;
             if !resource_names.insert(resource.name.as_str()) {
                 return invalid(format!("duplicate resource name {:?}", resource.name));
-            }
-            if !resource_keys.insert(Self::function_key(&resource.name)) {
-                return invalid(format!(
-                    "resource name {:?} collides after environment normalization",
-                    resource.name
-                ));
             }
             validate_absolute("resource path", &resource.path)?;
             if resource.path == Path::new("/dev") || !resource.path.starts_with("/dev") {
@@ -181,7 +172,6 @@ impl Profile {
         }
 
         let mut names = HashSet::new();
-        let mut environment_keys = HashSet::new();
         let mut mounts = HashSet::new();
         let mut devices = HashSet::new();
         for function in &self.functions {
@@ -190,12 +180,6 @@ impl Profile {
                     validate_name("HID function", &hid.name)?;
                     if !names.insert(hid.name.as_str()) {
                         return invalid(format!("duplicate function name {:?}", hid.name));
-                    }
-                    if !environment_keys.insert(Self::function_key(&hid.name)) {
-                        return invalid(format!(
-                            "function name {:?} collides after environment normalization",
-                            hid.name
-                        ));
                     }
                     if hid.report_length == 0 || hid.report_length > 4096 {
                         return invalid("HID report_length must be between 1 and 4096");
@@ -240,12 +224,6 @@ impl Profile {
                     if !names.insert(ffs.name.as_str()) {
                         return invalid(format!("duplicate function name {:?}", ffs.name));
                     }
-                    if !environment_keys.insert(Self::function_key(&ffs.name)) {
-                        return invalid(format!(
-                            "function name {:?} collides after environment normalization",
-                            ffs.name
-                        ));
-                    }
                     validate_absolute("FunctionFS mount", &ffs.mount)?;
                     let mount_name = ffs
                         .mount
@@ -277,18 +255,6 @@ impl Profile {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn function_key(name: &str) -> String {
-        name.bytes()
-            .map(|byte| {
-                if byte.is_ascii_alphanumeric() {
-                    byte.to_ascii_uppercase() as char
-                } else {
-                    '_'
-                }
-            })
-            .collect()
     }
 }
 
@@ -425,12 +391,12 @@ strings_hex = "02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00"
     }
 
     #[test]
-    fn rejects_function_environment_collisions() {
+    fn accepts_distinct_function_names_without_environment_normalization() {
         let source = format!(
             "{VALID}\n[[functions]]\ntype = \"functionfs\"\nname = \"ma-in\"\nmount = \"/dev/ffs-second\"\ndescriptors_hex = \"03 00 00 00 27 00 00 00 01 00 00 00 03 00 00 00 09 04 00 00 02 ff 00 00 00 07 05 01 02 40 00 00 07 05 81 02 40 00 00\"\nstrings_hex = \"02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00\"\n\n[[functions]]\ntype = \"hid\"\nname = \"ma_in\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor = \"/usr/share/test.hex\"\ndevice = \"/dev/hidg0\"\n"
         );
         let profile: Profile = toml::from_str(&source).unwrap();
-        assert!(profile.validate().is_err());
+        profile.validate().unwrap();
     }
 
     #[test]
@@ -470,22 +436,20 @@ strings_hex = "02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00"
     }
 
     #[test]
-    fn parses_optional_device_resources() {
+    fn parses_required_device_resources() {
         let source = format!(
-            "{VALID}\n[[resources]]\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\noptional = true\n"
+            "{VALID}\n[[resources]]\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\n"
         );
         let profile: Profile = toml::from_str(&source).unwrap();
         profile.validate().unwrap();
         assert_eq!(profile.resources.len(), 1);
-        assert!(profile.resources[0].optional);
     }
 
     #[test]
-    fn rejects_resource_environment_collisions() {
+    fn rejects_optional_resource_slots() {
         let source = format!(
-            "{VALID}\n[[resources]]\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\n\n[[resources]]\nname = \"display_i2c\"\npath = \"/dev/i2c-2\"\naccess = \"read-write\"\n"
+            "{VALID}\n[[resources]]\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\noptional = true\n"
         );
-        let profile: Profile = toml::from_str(&source).unwrap();
-        assert!(profile.validate().is_err());
+        assert!(toml::from_str::<Profile>(&source).is_err());
     }
 }

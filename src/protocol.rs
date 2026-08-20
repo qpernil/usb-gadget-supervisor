@@ -1,9 +1,8 @@
 use std::io;
 
-pub(crate) const CONTROL_FD_ENV: &str = "USB_GADGET_CONTROL_FD";
+pub(crate) const CONTROL_FD: i32 = 3;
 pub(crate) const STATE_DIRECTORY_ENV: &str = "USB_GADGET_STATE_DIRECTORY";
 pub(crate) const RUNTIME_DIRECTORY_ENV: &str = "USB_GADGET_RUNTIME_DIRECTORY";
-pub(crate) const RESOURCE_FD_ENV_PREFIX: &str = "USB_GADGET_RESOURCE_";
 
 const MAGIC: [u8; 4] = *b"UGSP";
 pub(crate) const VERSION: u8 = 1;

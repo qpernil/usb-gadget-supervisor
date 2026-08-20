@@ -46,10 +46,9 @@ Current profiles select one of these display arrangements:
 - ST7789 over SPI, scaling the unchanged framebuffer into a centered 240 by 120
   image on a 240 by 240 panel.
 
-The worker inherits the declared I2C, SPI, and GPIO descriptors across `exec`.
-Their descriptor numbers are named by `USB_GADGET_RESOURCE_<NAME>_FD`
-environment variables. It never opens the corresponding device paths and does
-not need ownership of those device nodes.
+The supervisor appends the declared display-bus and GPIO descriptors to the
+pre-bind `SCM_RIGHTS` bundle in profile order. The worker never opens the
+corresponding device paths and does not need ownership of those device nodes.
 
 An orderly worker exit blanks and powers off the selected display. `SIGKILL`
 cannot run process cleanup; the replacement worker clears the panel during
@@ -68,5 +67,5 @@ the supervisor writes the UDC attribute.
 The Trezor worker remains a separate executable. This preserves crash
 isolation, privilege separation, independent build and licensing boundaries,
 and a narrow capability surface: after privilege drop, the worker can access
-only the open descriptors, state directory, runtime directory, arguments, and
-environment explicitly supplied by the supervisor.
+only the open descriptors, state directory, runtime directory, and arguments
+explicitly supplied by the supervisor.

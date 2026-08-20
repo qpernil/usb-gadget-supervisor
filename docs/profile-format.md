@@ -41,13 +41,11 @@ runtime_directory = "/run/virtual-yubikey"
 name = "display-i2c"
 path = "/dev/i2c-1"
 access = "read-write"
-optional = true
 
 [[resources]]
 name = "buttons-gpio"
 path = "/dev/gpiochip0"
 access = "read-write"
-optional = true
 
 [[functions]]
 type = "hid"
@@ -88,16 +86,15 @@ though publication is a supervisor operation.
 
 `[[resources]]` entries let the root supervisor open a character device before
 starting the unprivileged worker. `access` is `read`, `write`, or `read-write`.
-If `optional` is false or omitted, missing or inaccessible hardware prevents
-startup. If it is true, a missing node is logged and omitted from the worker
-environment, allowing the same profile to run headlessly.
+Every declared resource is required; missing or inaccessible hardware prevents
+startup. This keeps the fixed descriptor layout unambiguous.
 
 The supervisor verifies that each resource is a non-symlink character device
-under `/dev`. It passes the open descriptor as
-`USB_GADGET_RESOURCE_<NORMALIZED_NAME>_FD`; all device-specific operations stay
-in the worker. A future Virtual YubiKey/Trezor OLED profile can therefore share
-root-only `/dev/i2c-1` and a selected `/dev/gpiochipN` without putting either
-worker in broad hardware groups.
+under `/dev`. It appends the open descriptors to `PREBIND_RESOURCES` in profile
+order; all device-specific operations stay in the worker. A Virtual
+YubiKey/Trezor OLED profile can therefore use root-only `/dev/i2c-1` and a
+selected `/dev/gpiochipN` without putting either worker in broad hardware
+groups.
 
 ## Trezor One example
 
@@ -161,7 +158,7 @@ The supervisor must reject profiles that violate any of these conditions:
 - Invalid FunctionFS v2 headers, counts, descriptor lengths, endpoint topology,
   or string tables.
 - Duplicate function names or mount paths.
-- Duplicate resource names, normalized environment keys, or device paths.
+- Duplicate resource names or device paths.
 - Resource paths outside `/dev` or resources that are not character devices.
 - FunctionFS mounts outside an approved `/dev/ffs-*` namespace.
 - A root worker account.

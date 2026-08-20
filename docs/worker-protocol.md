@@ -11,8 +11,8 @@ Supervisor, profile, and worker are deployed as one matched set.
 
 ## Transport and encoding
 
-The supervisor creates a local `AF_UNIX` `SOCK_SEQPACKET` socket pair. One end
-is inherited by the worker as `USB_GADGET_CONTROL_FD`. Packet boundaries remove
+The supervisor creates a local `AF_UNIX` `SOCK_SEQPACKET` socket pair. It
+duplicates the worker end onto fixed file descriptor 3 before `exec`. Packet boundaries remove
 the need for a stream decoder, and `SCM_RIGHTS` ancillary data carries open file
 descriptions independently of the eight-byte normal-data record.
 
@@ -47,14 +47,16 @@ There are no shutdown, detach, fatal, stopped, or reconnect messages. After
 ## Fixed resource order
 
 The magic/version selects one fixed layout. No per-descriptor identifiers or
-nullable slots are encoded. Optional resources, if a future profile needs any,
-must use a separate explicitly versioned message rather than changing the
-meaning of an existing slot.
+nullable slots are encoded. Profile resources are therefore mandatory. A
+future optional resource would need a separate explicitly versioned message
+rather than changing the meaning of an existing slot.
 
 `PREBIND_RESOURCES` contains, in profile function order:
 
 1. for every FunctionFS function, its `ep0` descriptor;
 2. immediately after it, `ep1` through `epN` in descriptor declaration order.
+3. after all FunctionFS descriptors, every `[[resources]]` character-device
+   descriptor in profile order.
 
 The supervisor parses the FunctionFS v2 descriptor blob to derive `N`, endpoint
 order, direction, and therefore the safe open mode. The worker and its installed
@@ -70,13 +72,12 @@ Current layouts are:
 | Worker | Pre-bind FDs | Post-bind FDs |
 | --- | --- | --- |
 | Virtual YubiKey | CCID `ep0`, bulk OUT, bulk IN, interrupt IN | FIDO HID |
-| Virtual Trezor | main `ep0`, OUT, IN | none |
+| Virtual Trezor | main `ep0`, OUT, IN, display bus, GPIO chip | none |
 
-Profile-declared non-USB character devices such as I2C, SPI, and GPIO remain
-opened before credential drop and inherited at `exec`. Their decimal descriptor
-numbers use `USB_GADGET_RESOURCE_<NAME>_FD`. They have the same important
-property: the worker receives authority to an open resource and does not gain
-permission to open its path.
+Profile-declared non-USB character devices such as I2C, SPI, and GPIO are
+opened by the supervisor and transferred in the same pre-bind `SCM_RIGHTS`
+packet. The worker receives authority to the open resources and never receives
+permission to open their paths.
 
 ## Startup sequence
 
@@ -84,7 +85,8 @@ permission to open its path.
    blobs.
 2. It creates the unbound ConfigFS gadget and root-only FunctionFS mounts.
 3. It writes each function's descriptors and strings to `ep0`.
-4. It opens every resulting endpoint with direction-appropriate access.
+4. It opens every resulting endpoint with direction-appropriate access and
+   every required local hardware resource with its declared access mode.
 5. It starts the unprivileged worker and sends `PREBIND_RESOURCES` with
    `SCM_RIGHTS`.
 6. The worker validates the exact layout, initializes state, and sends
@@ -117,18 +119,18 @@ the same incarnation cleanup and then ends the supervisor service. This uses
 process creation as the complete reset boundary instead of trying to repair
 endpoint state inside an old process.
 
-## Environment
+## Bootstrap and environment
 
-The supervisor clears the environment and supplies only:
+The control socket is always descriptor 3. The supervisor clears the
+environment and supplies only the two ordinary path settings:
 
 | Variable | Meaning |
 | --- | --- |
-| `USB_GADGET_CONTROL_FD` | Inherited control socket descriptor |
 | `USB_GADGET_STATE_DIRECTORY` | Persistent worker-owned state directory |
 | `USB_GADGET_RUNTIME_DIRECTORY` | Volatile worker runtime directory |
-| `USB_GADGET_RESOURCE_<NAME>_FD` | Approved inherited local hardware descriptor |
 
-There are no FunctionFS or HID path environment variables.
+There are no descriptor-number, FunctionFS, HID, or local-device path
+environment variables.
 
 ## Data path
 
