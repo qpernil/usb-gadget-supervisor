@@ -1,7 +1,5 @@
 # Profile Format
 
-Hostnames and device/account identifiers below are illustrative; replace them with your own configured values.
-
 ## Purpose
 
 A profile is a declarative, root-owned description of one host-visible USB
@@ -32,9 +30,9 @@ product = "Virtual Yubico YubiKey FIDO+CCID"
 max_power_ma = 30
 
 [worker]
-command = "/home/worker/virtual-yubikey/target/release/virtual-yubikey-worker"
+command = "/absolute/path/to/virtual-yubikey-worker"
 arguments = ["--serial", "12345678", "--log-level", "info"]
-run_as = "worker"
+run_as = "worker-account"
 readiness_timeout_ms = 10000
 state_directory = "/var/lib/virtual-yubikey"
 runtime_directory = "/run/virtual-yubikey"
@@ -123,8 +121,8 @@ serial = "virtual-trezor-one"
 max_power_ma = 100
 
 [worker]
-command = "/home/worker/virtual-trezor/build/virtual-trezor-worker"
-run_as = "worker"
+command = "/absolute/path/to/virtual-trezor-worker"
+run_as = "worker-account"
 readiness_timeout_ms = 30000
 state_directory = "/var/lib/virtual-trezor"
 runtime_directory = "/run/virtual-trezor"
