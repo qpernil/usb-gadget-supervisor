@@ -554,58 +554,54 @@ impl Runtime {
     }
 
     fn request_gpio_lines(&self, resource: &GpioLinesResource) -> io::Result<File> {
-        use gpiocdev_uapi::v2::{self, LineConfig, LineFlags, LineRequest, LineValues, Offsets};
+        use gpiocdev::line::{Bias, EdgeDetection, Value, Values};
+        use gpiocdev::Request;
 
         validate_character_device(&resource.name, &resource.path)?;
-        let chip = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&resource.path)
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "open GPIO chip for resource {} at {}: {error}",
-                        resource.name,
-                        resource.path.display()
-                    ),
-                )
-            })?;
-
-        let mut flags = match resource.direction {
-            GpioDirection::Input => LineFlags::INPUT,
-            GpioDirection::Output => LineFlags::OUTPUT,
-        };
+        let mut builder = Request::builder();
+        builder
+            .on_chip(&resource.path)
+            .with_consumer(&resource.name);
+        match resource.direction {
+            GpioDirection::Input => {
+                builder.with_lines(&resource.offsets).as_input();
+            }
+            GpioDirection::Output => {
+                let values: Values = resource
+                    .offsets
+                    .iter()
+                    .copied()
+                    .zip(
+                        resource
+                            .initial_values
+                            .as_ref()
+                            .expect("validated GPIO outputs have initial values")
+                            .iter()
+                            .copied()
+                            .map(Value::from),
+                    )
+                    .collect();
+                builder.with_output_lines(&values);
+            }
+        }
         if resource.active_low {
-            flags |= LineFlags::ACTIVE_LOW;
+            builder.as_active_low();
         }
-        flags |= match resource.bias {
-            Some(GpioBias::PullUp) => LineFlags::BIAS_PULL_UP,
-            Some(GpioBias::PullDown) => LineFlags::BIAS_PULL_DOWN,
-            Some(GpioBias::Disabled) => LineFlags::BIAS_DISABLED,
-            None => LineFlags::empty(),
-        };
-        flags |= match resource.edge {
-            Some(GpioEdge::Rising) => LineFlags::EDGE_RISING,
-            Some(GpioEdge::Falling) => LineFlags::EDGE_FALLING,
-            Some(GpioEdge::Both) => LineFlags::EDGE_RISING | LineFlags::EDGE_FALLING,
-            None => LineFlags::empty(),
-        };
-        let mut config = LineConfig {
-            flags,
-            ..Default::default()
-        };
-        if let Some(values) = &resource.initial_values {
-            config.add_values(&LineValues::from_slice(values));
+        if let Some(bias) = resource.bias {
+            builder.with_bias(match bias {
+                GpioBias::PullUp => Bias::PullUp,
+                GpioBias::PullDown => Bias::PullDown,
+                GpioBias::Disabled => Bias::Disabled,
+            });
         }
-        let request = LineRequest {
-            offsets: Offsets::from_slice(&resource.offsets),
-            consumer: resource.name.as_str().into(),
-            config,
-            num_lines: resource.offsets.len() as u32,
-            ..Default::default()
-        };
-        let lines = v2::get_line(&chip, request).map_err(|error| {
+        if let Some(edge) = resource.edge {
+            builder.with_edge_detection(match edge {
+                GpioEdge::Rising => EdgeDetection::RisingEdge,
+                GpioEdge::Falling => EdgeDetection::FallingEdge,
+                GpioEdge::Both => EdgeDetection::BothEdges,
+            });
+        }
+        let request = builder.request().map_err(|error| {
             io::Error::other(format!(
                 "request GPIO resource {} at {} offsets {:?}: {error}",
                 resource.name,
@@ -613,6 +609,18 @@ impl Runtime {
                 resource.offsets
             ))
         })?;
+        let duplicated = unsafe { libc::fcntl(request.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicated < 0 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "duplicate GPIO resource {} request for worker handoff: {error}",
+                    resource.name
+                ),
+            ));
+        }
+        let lines = unsafe { File::from_raw_fd(duplicated) };
         println!(
             "usb-gadget-supervisor: claimed required GPIO resource {} at {} offsets {:?}",
             resource.name,
