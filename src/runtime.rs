@@ -34,6 +34,26 @@ struct WorkerIdentity {
     gid: u32,
 }
 
+enum ResourceHandle {
+    File(File),
+    Gpio(gpiocdev::Request),
+}
+
+impl AsRawFd for ResourceHandle {
+    fn as_raw_fd(&self) -> i32 {
+        match self {
+            Self::File(file) => file.as_raw_fd(),
+            Self::Gpio(request) => request.as_raw_fd(),
+        }
+    }
+}
+
+impl From<File> for ResourceHandle {
+    fn from(file: File) -> Self {
+        Self::File(file)
+    }
+}
+
 pub(crate) struct Runtime {
     profile_path: PathBuf,
     profile: Profile,
@@ -384,7 +404,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn publish_and_open_functionfs(&self) -> io::Result<Vec<File>> {
+    fn publish_and_open_functionfs(&self) -> io::Result<Vec<ResourceHandle>> {
         let mut files = Vec::new();
         for function in &self.profile.functions {
             let FunctionProfile::Functionfs(ffs) = function else {
@@ -406,7 +426,7 @@ impl Runtime {
                 .open(ffs.mount.join("ep0"))?;
             ep0.write_all(&descriptors)?;
             ep0.write_all(&strings)?;
-            files.push(ep0);
+            files.push(ep0.into());
             for (index, endpoint) in endpoints.iter().enumerate() {
                 let path = ffs.mount.join(format!("ep{}", index + 1));
                 let metadata = fs::symlink_metadata(&path)?;
@@ -428,7 +448,7 @@ impl Runtime {
                         options.write(true);
                     }
                 }
-                files.push(options.custom_flags(libc::O_NONBLOCK).open(path)?);
+                files.push(options.custom_flags(libc::O_NONBLOCK).open(path)?.into());
             }
             println!(
                 "usb-gadget-supervisor: published FunctionFS {} with {} data endpoints",
@@ -439,7 +459,7 @@ impl Runtime {
         Ok(files)
     }
 
-    fn spawn_worker(&mut self, prebind: &[File]) -> io::Result<()> {
+    fn spawn_worker(&mut self, prebind: &[ResourceHandle]) -> io::Result<()> {
         let (mut supervisor, worker_control) = seqpacket_pair()?;
         supervisor.set_read_timeout(Some(Duration::from_millis(
             self.profile.worker.readiness_timeout_ms,
@@ -507,16 +527,18 @@ impl Runtime {
         Ok(())
     }
 
-    fn open_resources(&self) -> io::Result<Vec<File>> {
+    fn open_resources(&self) -> io::Result<Vec<ResourceHandle>> {
         let mut opened = Vec::new();
         for resource in &self.profile.resources {
-            let file = match resource {
+            let handle = match resource {
                 ResourceProfile::CharacterDevice(resource) => {
-                    self.open_character_device(resource)?
+                    self.open_character_device(resource)?.into()
                 }
-                ResourceProfile::GpioLines(resource) => self.request_gpio_lines(resource)?,
+                ResourceProfile::GpioLines(resource) => {
+                    ResourceHandle::Gpio(self.request_gpio_lines(resource)?)
+                }
             };
-            opened.push(file);
+            opened.push(handle);
         }
         Ok(opened)
     }
@@ -553,7 +575,7 @@ impl Runtime {
         Ok(file)
     }
 
-    fn request_gpio_lines(&self, resource: &GpioLinesResource) -> io::Result<File> {
+    fn request_gpio_lines(&self, resource: &GpioLinesResource) -> io::Result<gpiocdev::Request> {
         use gpiocdev::line::{Bias, EdgeDetection, Value, Values};
         use gpiocdev::Request;
 
@@ -609,25 +631,13 @@ impl Runtime {
                 resource.offsets
             ))
         })?;
-        let duplicated = unsafe { libc::fcntl(request.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if duplicated < 0 {
-            let error = io::Error::last_os_error();
-            return Err(io::Error::new(
-                error.kind(),
-                format!(
-                    "duplicate GPIO resource {} request for worker handoff: {error}",
-                    resource.name
-                ),
-            ));
-        }
-        let lines = unsafe { File::from_raw_fd(duplicated) };
         println!(
             "usb-gadget-supervisor: claimed required GPIO resource {} at {} offsets {:?}",
             resource.name,
             resource.path.display(),
             resource.offsets
         );
-        Ok(lines)
+        Ok(request)
     }
 
     fn link_functions(&self) -> io::Result<()> {
@@ -1070,10 +1080,10 @@ fn seqpacket_pair() -> io::Result<(UnixStream, UnixStream)> {
     })
 }
 
-fn send_message_with_files(
+fn send_message_with_files<T: AsRawFd>(
     channel: &mut UnixStream,
     message: Message,
-    files: &[File],
+    files: &[T],
 ) -> io::Result<()> {
     let descriptor_count = u16::try_from(files.len()).map_err(|_| {
         io::Error::new(
