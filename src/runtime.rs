@@ -338,6 +338,33 @@ impl Runtime {
         fs::create_dir(&config)?;
         write_attribute(&config.join("MaxPower"), &usb.max_power_ma.to_string())?;
 
+        if let Some(microsoft) = &usb.microsoft_os_1 {
+            let os_desc = self.gadget.join("os_desc");
+            write_attribute(
+                &os_desc.join("b_vendor_code"),
+                &format!("0x{:02x}", microsoft.vendor_code),
+            )?;
+            write_attribute(&os_desc.join("qw_sign"), &microsoft.signature)?;
+            write_attribute(&os_desc.join("use"), "1")?;
+            std::os::unix::fs::symlink(&config, os_desc.join("c.1"))?;
+        }
+
+        if let Some(webusb) = &usb.webusb {
+            let directory = self.gadget.join("webusb");
+            write_attribute(
+                &directory.join("bcdVersion"),
+                &format!("0x{:04x}", webusb.version),
+            )?;
+            write_attribute(
+                &directory.join("bVendorCode"),
+                &format!("0x{:02x}", webusb.vendor_code),
+            )?;
+            if !webusb.landing_page.is_empty() {
+                write_attribute(&directory.join("landingPage"), &webusb.landing_page)?;
+            }
+            write_attribute(&directory.join("use"), "1")?;
+        }
+
         for function in &self.profile.functions {
             match function {
                 FunctionProfile::Hid(hid) => {
@@ -398,7 +425,7 @@ impl Runtime {
                 &ffs.strings_hex,
                 &format!("FunctionFS {} strings", ffs.name),
             )?;
-            let endpoints = functionfs::inspect(&descriptors, &strings)?;
+            let inspection = functionfs::inspect(&descriptors, &strings)?;
             let mut ep0 = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -407,7 +434,7 @@ impl Runtime {
             ep0.write_all(&descriptors)?;
             ep0.write_all(&strings)?;
             files.push(ep0);
-            for (index, endpoint) in endpoints.iter().enumerate() {
+            for (index, endpoint) in inspection.endpoints.iter().enumerate() {
                 let path = ffs.mount.join(format!("ep{}", index + 1));
                 let metadata = fs::symlink_metadata(&path)?;
                 if metadata.file_type().is_symlink() {
@@ -707,6 +734,7 @@ impl Runtime {
     }
 
     fn remove_gadget_tree(&self) -> io::Result<()> {
+        remove_file_if_exists(&self.gadget.join("os_desc/c.1"))?;
         for function in self.profile.functions.iter().rev() {
             let directory = match function {
                 FunctionProfile::Hid(hid) => format!("hid.{}", hid.name),

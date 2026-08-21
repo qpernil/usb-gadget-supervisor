@@ -143,6 +143,15 @@ product = "Virtual Trezor"
 serial = "virtual-trezor-one"
 max_power_ma = 100
 
+[usb.microsoft_os_1]
+vendor_code = 0x21
+signature = "MSFT100"
+
+[usb.webusb]
+version = 0x0100
+vendor_code = 0x01
+landing_page = ""
+
 [worker]
 command = "/absolute/path/to/virtual-trezor-worker"
 run_as = "worker-account"
@@ -167,6 +176,23 @@ DebugLink and the separate U2F HID interface are not present. Profile order
 remains the deterministic interface order whenever more than one function is
 declared.
 
+`usb.microsoft_os_1` enables the Microsoft OS 1.0 string in ConfigFS. A
+FunctionFS blob in the same profile must set `FUNCTIONFS_HAS_MS_OS_DESC` and
+carry at least one compatible-ID or extended-properties descriptor. The
+supervisor requires both halves together, validates the referenced interface
+numbers, and links configuration `c.1` into the gadget's `os_desc` group. The
+Trezor profile uses compatible ID `WINUSB` for interface zero and publishes
+the upstream Trezor `DeviceInterfaceGUIDs` value, allowing Windows to bind its
+inbox WinUSB driver without changing the interface from vendor-specific USB.
+
+`usb.webusb` enables the ConfigFS WebUSB BOS platform capability. Version
+`0x0100` and a nonzero vendor request code are required; `landing_page` may be
+empty, as it is for the current Trezor profile, or an ASCII HTTP(S) URL. WebUSB
+is browser discovery/access metadata and does not replace a Windows driver.
+Profiles using it need `usb.bcd_usb` of at least `0x0201` so hosts request the
+BOS descriptor. Startup fails clearly if the running kernel lacks ConfigFS
+WebUSB support.
+
 ## Validation
 
 The supervisor must reject profiles that violate any of these conditions:
@@ -179,7 +205,9 @@ The supervisor must reject profiles that violate any of these conditions:
   without an applicable execute bit.
 - Invalid VID/PID, USB version, endpoint size, power, class, or protocol values.
 - Invalid FunctionFS v2 headers, counts, descriptor lengths, endpoint topology,
-  or string tables.
+  Microsoft OS feature descriptors, or string tables.
+- Microsoft OS ConfigFS settings without matching FunctionFS OS descriptors,
+  or FunctionFS OS descriptors without the global settings.
 - Duplicate function names or mount paths.
 - Duplicate resource names, duplicate character-device paths, duplicate GPIO
   offsets within a group, or overlapping GPIO claims on one chip.
