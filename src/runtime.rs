@@ -576,7 +576,7 @@ impl Runtime {
     }
 
     fn request_gpio_lines(&self, resource: &GpioLinesResource) -> io::Result<gpiocdev::Request> {
-        use gpiocdev::line::{Bias, EdgeDetection, Value, Values};
+        use gpiocdev::line::{Bias, EdgeDetection};
         use gpiocdev::Request;
 
         validate_character_device(&resource.name, &resource.path)?;
@@ -589,21 +589,14 @@ impl Runtime {
                 builder.with_lines(&resource.offsets).as_input();
             }
             GpioDirection::Output => {
-                let values: Values = resource
-                    .offsets
-                    .iter()
-                    .copied()
-                    .zip(
-                        resource
-                            .initial_values
-                            .as_ref()
-                            .expect("validated GPIO outputs have initial values")
-                            .iter()
-                            .copied()
-                            .map(Value::from),
-                    )
-                    .collect();
-                builder.with_output_lines(&values);
+                configure_gpio_outputs(
+                    &mut builder,
+                    &resource.offsets,
+                    resource
+                        .initial_values
+                        .as_ref()
+                        .expect("validated GPIO outputs have initial values"),
+                );
             }
         }
         if resource.active_low {
@@ -770,6 +763,53 @@ impl Runtime {
         remove_dir_if_exists(&self.gadget.join("configs/c.1"))?;
         remove_dir_if_exists(&self.gadget.join("strings/0x409"))?;
         remove_dir_if_exists(&self.gadget)
+    }
+}
+
+fn configure_gpio_outputs(
+    builder: &mut gpiocdev::request::Builder,
+    offsets: &[u32],
+    initial_values: &[bool],
+) {
+    use gpiocdev::line::Value;
+
+    builder.with_lines(offsets).as_output(Value::Inactive);
+    for (offset, value) in offsets.iter().zip(initial_values) {
+        builder.with_line(*offset).with_value(Value::from(*value));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configure_gpio_outputs;
+    use gpiocdev::line::{Direction, Value};
+    use gpiocdev::Request;
+
+    #[test]
+    fn gpio_outputs_preserve_profile_order_and_values() {
+        let mut builder = Request::builder();
+        configure_gpio_outputs(&mut builder, &[25, 27, 24], &[false, true, false]);
+
+        let config = builder.config();
+        assert_eq!(config.lines(), &[25, 27, 24]);
+        assert_eq!(
+            config
+                .line_config(25)
+                .map(|line| (line.direction, line.value)),
+            Some((Some(Direction::Output), Some(Value::Inactive)))
+        );
+        assert_eq!(
+            config
+                .line_config(27)
+                .map(|line| (line.direction, line.value)),
+            Some((Some(Direction::Output), Some(Value::Active)))
+        );
+        assert_eq!(
+            config
+                .line_config(24)
+                .map(|line| (line.direction, line.value)),
+            Some((Some(Direction::Output), Some(Value::Inactive)))
+        );
     }
 }
 
