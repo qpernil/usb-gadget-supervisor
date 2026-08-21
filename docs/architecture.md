@@ -53,8 +53,8 @@ Each FunctionFS profile entry includes complete v2 descriptor and string blobs.
 Before a worker exists, the supervisor:
 
 1. validates the blob header, total length, speed-set counts, individual USB
-   descriptor lengths, endpoint addresses, endpoint directions, and string
-   table;
+   descriptor lengths, endpoint addresses, endpoint directions, Microsoft OS
+   feature descriptors, and string table;
 2. requires identical endpoint topology across full/high/super speed sets;
 3. mounts FunctionFS root-only;
 4. writes descriptors and strings to `ep0`;
@@ -64,6 +64,13 @@ Before a worker exists, the supervisor:
 The kernel remains the final USB semantic validator. The supervisor parser adds
 early diagnostics, derives the exact resource bundle, and prevents a mismatch
 between the profile and the endpoints it hands to a worker.
+
+Profiles may also request global Microsoft OS 1.0 and WebUSB settings. The
+supervisor configures the ConfigFS `os_desc` string/vendor code and configuration
+link when a FunctionFS function contains the matching OS feature descriptors.
+It separately configures the WebUSB BOS capability. This keeps the device-owned
+WinUSB compatible ID, interface GUID, and WebUSB request codes declarative while
+leaving the privileged ConfigFS operation in the supervisor.
 
 Local hardware follows the same capability model. The supervisor opens I2C or
 SPI character devices and uses the GPIO v2 API to claim profile-declared line

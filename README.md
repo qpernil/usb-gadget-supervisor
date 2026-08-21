@@ -44,7 +44,9 @@ not a compatibility goal.
 Endpoint data is never proxied through the supervisor. The supervisor validates
 and publishes profile-owned FunctionFS descriptors, then transfers the open
 endpoint files to the worker. The supervisor retains control only over gadget
-configuration and lifecycle.
+configuration and lifecycle. Device profiles may also request validated
+Microsoft OS 1.0/WinUSB metadata and a WebUSB BOS capability; the supervisor
+publishes their required global ConfigFS settings.
 
 ## Project boundaries
 

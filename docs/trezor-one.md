@@ -32,6 +32,15 @@ the supervisor does not proxy or interpret them.
 The current profile exposes only the main vendor interface. DebugLink and the
 separate U2F HID interface are not exposed.
 
+The FunctionFS blob also carries the upstream-compatible Microsoft OS 1.0
+features for interface zero: compatible ID `WINUSB` and
+`DeviceInterfaceGUIDs={0263b512-88cb-4136-9613-5c8e109d8ef5}`. The profile
+sets ConfigFS signature `MSFT100` with vendor request code `0x21`, so Windows
+can bind its inbox WinUSB driver while the USB interface remains vendor class.
+The independent WebUSB BOS capability uses version 1.0 and request code
+`0x01`, with no automatic landing page. WebUSB supports browser discovery and
+permissioned access; it is not the Windows driver.
+
 ## Display and buttons
 
 The upstream firmware owns its 128 by 64, 1,024-byte monochrome framebuffer and

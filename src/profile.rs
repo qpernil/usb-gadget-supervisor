@@ -108,6 +108,25 @@ pub(crate) struct UsbProfile {
     pub(crate) product: String,
     pub(crate) serial: Option<String>,
     pub(crate) max_power_ma: u16,
+    #[serde(default)]
+    pub(crate) microsoft_os_1: Option<MicrosoftOs10Profile>,
+    #[serde(default)]
+    pub(crate) webusb: Option<WebUsbProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MicrosoftOs10Profile {
+    pub(crate) vendor_code: u8,
+    pub(crate) signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WebUsbProfile {
+    pub(crate) version: u16,
+    pub(crate) vendor_code: u8,
+    pub(crate) landing_page: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -188,6 +207,35 @@ impl Profile {
         if let Some(serial) = &self.usb.serial {
             if serial.is_empty() || serial.len() > 126 {
                 return invalid("usb.serial must contain 1 to 126 bytes when present");
+            }
+        }
+        if let Some(microsoft) = &self.usb.microsoft_os_1 {
+            if microsoft.vendor_code == 0 {
+                return invalid("usb.microsoft_os_1.vendor_code must not be zero");
+            }
+            if microsoft.signature != "MSFT100" {
+                return invalid("usb.microsoft_os_1.signature must be MSFT100");
+            }
+        }
+        if let Some(webusb) = &self.usb.webusb {
+            if self.usb.bcd_usb < 0x0201 {
+                return invalid("usb.bcd_usb must be at least 0x0201 when WebUSB is enabled");
+            }
+            if webusb.version != 0x0100 {
+                return invalid("usb.webusb.version must be 0x0100");
+            }
+            if webusb.vendor_code == 0 {
+                return invalid("usb.webusb.vendor_code must not be zero");
+            }
+            if webusb.landing_page.len() > 252
+                || !webusb.landing_page.is_ascii()
+                || (!webusb.landing_page.is_empty()
+                    && !webusb.landing_page.starts_with("https://")
+                    && !webusb.landing_page.starts_with("http://"))
+            {
+                return invalid(
+                    "usb.webusb.landing_page must be empty or an ASCII HTTP(S) URL up to 252 bytes",
+                );
             }
         }
         validate_absolute("worker.command", &self.worker.command)?;
@@ -296,6 +344,7 @@ impl Profile {
         let mut names = HashSet::new();
         let mut mounts = HashSet::new();
         let mut devices = HashSet::new();
+        let mut has_ms_os_descriptors = false;
         for function in &self.functions {
             match function {
                 FunctionProfile::Hid(hid) => {
@@ -372,9 +421,15 @@ impl Profile {
                         &ffs.strings_hex,
                         &format!("FunctionFS {} strings", ffs.name),
                     )?;
-                    functionfs::inspect(&descriptors, &strings)?;
+                    let inspection = functionfs::inspect(&descriptors, &strings)?;
+                    has_ms_os_descriptors |= inspection.has_ms_os_descriptors;
                 }
             }
+        }
+        if has_ms_os_descriptors != self.usb.microsoft_os_1.is_some() {
+            return invalid(
+                "usb.microsoft_os_1 and FunctionFS Microsoft OS descriptors must be declared together",
+            );
         }
         Ok(())
     }
@@ -501,6 +556,16 @@ strings_hex = "02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00"
     fn rejects_unknown_fields() {
         let error = toml::from_str::<Profile>(&format!("{VALID}\nsecret = true\n")).unwrap_err();
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_microsoft_os_settings_without_functionfs_os_descriptors() {
+        let source =
+            format!("{VALID}\n[usb.microsoft_os_1]\nvendor_code = 0x21\nsignature = \"MSFT100\"\n");
+        assert!(toml::from_str::<Profile>(&source)
+            .unwrap()
+            .validate()
+            .is_err());
     }
 
     #[test]
