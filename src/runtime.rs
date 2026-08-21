@@ -760,39 +760,6 @@ fn gpio_line_request(resource: &GpioLinesResource) -> gpiocdev_uapi::v2::LineReq
     }
 }
 
-#[cfg(test)]
-mod gpio_tests {
-    use super::gpio_line_request;
-    use crate::profile::{GpioDirection, GpioLinesResource};
-    use gpiocdev_uapi::v2::LineAttributeValue;
-    use std::path::PathBuf;
-
-    #[test]
-    fn request_preserves_profile_order_and_value_bits() {
-        let resource = GpioLinesResource {
-            name: "display-control".into(),
-            path: PathBuf::from("/dev/gpiochip0"),
-            offsets: vec![25, 27, 24],
-            direction: GpioDirection::Output,
-            active_low: false,
-            bias: None,
-            edge: None,
-            initial_values: Some(vec![false, true, false]),
-        };
-
-        let request = gpio_line_request(&resource);
-        assert_eq!(request.num_lines, 3);
-        assert_eq!(request.offsets.get(0), 25);
-        assert_eq!(request.offsets.get(1), 27);
-        assert_eq!(request.offsets.get(2), 24);
-        assert_eq!(request.config.attr(0).mask, 0b111);
-        assert_eq!(
-            request.config.attr(0).attr.to_value(),
-            Some(LineAttributeValue::Values(0b010))
-        );
-    }
-}
-
 fn drain_signal_notifications(descriptor: i32) -> io::Result<()> {
     let mut bytes = [0_u8; 64];
     loop {
@@ -1302,5 +1269,38 @@ fn record_error(first_error: &mut Option<io::Error>, result: io::Result<()>) {
         if first_error.is_none() {
             *first_error = Some(error);
         }
+    }
+}
+
+#[cfg(test)]
+mod gpio_tests {
+    use super::gpio_line_request;
+    use crate::profile::{GpioDirection, GpioLinesResource};
+    use gpiocdev_uapi::v2::LineAttributeValue;
+    use std::path::PathBuf;
+
+    #[test]
+    fn request_preserves_profile_order_and_value_bits() {
+        let resource = GpioLinesResource {
+            name: "display-control".into(),
+            path: PathBuf::from("/dev/gpiochip0"),
+            offsets: vec![25, 27, 24],
+            direction: GpioDirection::Output,
+            active_low: false,
+            bias: None,
+            edge: None,
+            initial_values: Some(vec![false, true, false]),
+        };
+
+        let request = gpio_line_request(&resource);
+        assert_eq!(request.num_lines, 3);
+        assert_eq!(request.offsets.get(0), 25);
+        assert_eq!(request.offsets.get(1), 27);
+        assert_eq!(request.offsets.get(2), 24);
+        assert_eq!(request.config.attr(0).mask, 0b111);
+        assert_eq!(
+            request.config.attr(0).attr.to_value(),
+            Some(LineAttributeValue::Values(0b010))
+        );
     }
 }
