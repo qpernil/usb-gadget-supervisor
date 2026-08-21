@@ -460,7 +460,7 @@ impl Runtime {
             println!(
                 "usb-gadget-supervisor: published FunctionFS {} with {} data endpoints",
                 ffs.name,
-                endpoints.len()
+                inspection.endpoints.len()
             );
         }
         Ok(files)
