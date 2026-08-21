@@ -38,14 +38,20 @@ state_directory = "/var/lib/virtual-yubikey"
 runtime_directory = "/run/virtual-yubikey"
 
 [[resources]]
+type = "character-device"
 name = "display-i2c"
 path = "/dev/i2c-1"
 access = "read-write"
 
 [[resources]]
-name = "buttons-gpio"
+type = "gpio-lines"
+name = "buttons"
 path = "/dev/gpiochip0"
-access = "read-write"
+offsets = [5, 26, 13]
+direction = "input"
+active_low = true
+bias = "pull-up"
+edge = "both"
 
 [[functions]]
 type = "hid"
@@ -84,17 +90,34 @@ though publication is a supervisor operation.
 
 ## Local hardware resources
 
-`[[resources]]` entries let the root supervisor open a character device before
-starting the unprivileged worker. `access` is `read`, `write`, or `read-write`.
-Every declared resource is required; missing or inaccessible hardware prevents
-startup. This keeps the fixed descriptor layout unambiguous.
+`[[resources]]` entries let the root supervisor acquire local hardware before
+starting the unprivileged worker. Every entry has an explicit `type`, and every
+declared resource is required. Missing or inaccessible hardware prevents
+startup, keeping the fixed descriptor layout unambiguous.
 
-The supervisor verifies that each resource is a non-symlink character device
-under `/dev`. It appends the open descriptors to `PREBIND_RESOURCES` in profile
-order; all device-specific operations stay in the worker. A Virtual
-YubiKey/Trezor OLED profile can therefore use root-only `/dev/i2c-1` and a
-selected `/dev/gpiochipN` without putting either worker in broad hardware
-groups.
+A `character-device` resource opens one non-symlink device under `/dev`.
+`access` is `read`, `write`, or `read-write`. This is appropriate for I2C and
+SPI bus descriptors.
+
+A `gpio-lines` resource asks the Linux GPIO v2 API for exclusive ownership of
+an ordered group of 1 to 64 offsets on one GPIO chip. `direction` is `input` or
+`output`. Input groups may set `active_low`, `bias` (`pull-up`, `pull-down`, or
+`disabled`), and `edge` (`rising`, `falling`, or `both`). Output groups require
+one boolean `initial_values` item per offset so all lines enter an explicit
+safe state as the group is claimed. Output groups cannot set input bias or edge
+detection.
+
+The order of `offsets` becomes the bit order of GPIO value operations: offset
+zero is bit zero, and so on. Multiple disjoint groups may use the same GPIO
+chip, but the profile validator rejects a line claimed by more than one group.
+The supervisor passes the returned line-request handle—not the GPIO-chip
+handle—to the worker. Consequently the worker can read, write, and poll only
+the exact lines it inherited and cannot request additional lines.
+
+All acquired descriptors are appended to `PREBIND_RESOURCES` in profile order.
+A Virtual Trezor profile can therefore receive one display-bus descriptor, one
+display-control output handle, and one pollable button input handle without
+requiring broad I2C, SPI, or GPIO group membership.
 
 ## Trezor One example
 
@@ -158,8 +181,10 @@ The supervisor must reject profiles that violate any of these conditions:
 - Invalid FunctionFS v2 headers, counts, descriptor lengths, endpoint topology,
   or string tables.
 - Duplicate function names or mount paths.
-- Duplicate resource names or device paths.
-- Resource paths outside `/dev` or resources that are not character devices.
+- Duplicate resource names, duplicate character-device paths, duplicate GPIO
+  offsets within a group, or overlapping GPIO claims on one chip.
+- Resource paths outside `/dev`, resources that are not character devices, or
+  invalid GPIO direction/bias/edge/initial-value combinations.
 - FunctionFS mounts outside an approved `/dev/ffs-*` namespace.
 - A root worker account.
 - A profile that declares no functions.
