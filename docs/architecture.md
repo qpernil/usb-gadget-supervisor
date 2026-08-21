@@ -161,6 +161,41 @@ Local I2C, SPI, and GPIO descriptors use the same mechanism: the supervisor
 opens them and appends them to the pre-bind `SCM_RIGHTS` bundle in profile
 order. Device-specific ioctls and policy remain in the worker.
 
+## Unix architecture, Linux mechanism
+
+The supervisor is a Unix-style architecture built on Linux-specific device
+facilities. Unix provides the process model: small programs with narrow
+responsibilities, standard process lifecycle, users and permissions, local
+sockets, and file descriptors that act as both communication channels and
+capabilities. A fresh worker process is a meaningful reset boundary, and an
+open descriptor is a concrete grant of authority rather than merely a path to
+reopen later.
+
+Linux provides the particular mechanisms that make this virtual USB device
+possible: UDC gadget mode, ConfigFS, FunctionFS, HID gadget nodes, the GPIO
+character-device API, and the I2C and SPI device interfaces. Another Unix-like
+system could preserve the supervisor/worker process architecture, but would
+need a different implementation of this device-facing layer.
+
+In short: Unix makes the design natural; Linux makes this particular device
+possible.
+
+## Operational transparency
+
+The supervisor is intended to automate an understandable manual procedure, not
+to create a second hidden system. Profiles are ordinary root-owned files,
+workers are ordinary executables, services are ordinary systemd units, and the
+supervisor can be invoked directly from a shell. ConfigFS objects, processes,
+open descriptors, mounts, and logs remain inspectable through normal Linux
+interfaces.
+
+The same rule applies to surrounding automation. CI should invoke repository
+build and test commands rather than contain a private build implementation;
+deployment tools should perform the documented install and service operations
+rather than become a runtime requirement. If CI or configuration automation is
+unavailable, an operator should still be able to build, install, start, stop,
+inspect, and debug the system manually.
+
 ## Supported worker shapes
 
 | Device | Kernel surface | Worker data plane |
