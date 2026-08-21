@@ -2,12 +2,14 @@
 
 use crate::functionfs::{self, Direction};
 use crate::profile::{
-    decode_hex_blob, decode_hex_descriptor, FunctionProfile, HidFunction, Profile, ResourceAccess,
+    decode_hex_blob, decode_hex_descriptor, CharacterDeviceResource, FunctionProfile, GpioBias,
+    GpioDirection, GpioEdge, GpioLinesResource, HidFunction, Profile, ResourceAccess,
+    ResourceProfile,
 };
 use crate::protocol::{
     Message, CONTROL_FD, PACKET_LENGTH, RUNTIME_DIRECTORY_ENV, STATE_DIRECTORY_ENV,
 };
-use crate::STOP_REQUESTED;
+use crate::{RESTART_REQUESTED, STOP_REQUESTED};
 use std::ffi::{c_void, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -33,6 +35,7 @@ struct WorkerIdentity {
 }
 
 pub(crate) struct Runtime {
+    profile_path: PathBuf,
     profile: Profile,
     identity: WorkerIdentity,
     gadget: PathBuf,
@@ -75,6 +78,7 @@ impl Runtime {
         let configfs_mounted_by_us = ensure_configfs()?;
         let gadget = Path::new(GADGET_ROOT).join(&profile.name);
         let mut runtime = Self {
+            profile_path,
             profile,
             identity,
             gadget,
@@ -94,27 +98,57 @@ impl Runtime {
         Ok(runtime)
     }
 
-    pub(crate) fn serve(&mut self) -> io::Result<()> {
+    pub(crate) fn serve(&mut self, signal_fd: i32) -> io::Result<()> {
         while !STOP_REQUESTED.load(Ordering::Relaxed) {
+            let mut replacement = None;
             let mut restart_reason = None;
-            if let Some(status) = self.worker.as_mut().expect("worker exists").try_wait()? {
-                restart_reason = Some(format!("worker exited with {status}"));
+            if RESTART_REQUESTED.swap(false, Ordering::Relaxed) {
+                match self.load_replacement_profile() {
+                    Ok(loaded) => {
+                        replacement = Some(loaded);
+                        restart_reason =
+                            Some("SIGHUP requested a validated profile reload".to_owned());
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "usb-gadget-supervisor: rejected SIGHUP profile reload; current incarnation remains active: {error}"
+                        );
+                        continue;
+                    }
+                }
             }
             if restart_reason.is_none() {
-                match self.receive() {
-                    Ok((message, count)) => {
-                        restart_reason = Some(format!(
-                            "unexpected runtime control message {message:?} with {count} descriptors"
-                        ));
+                if let Some(status) = self.worker.as_mut().expect("worker exists").try_wait()? {
+                    restart_reason = Some(format!("worker exited with {status}"));
+                }
+            }
+            if restart_reason.is_none() {
+                match self.wait_for_control_activity(signal_fd) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        restart_reason = Some(format!("wait for worker lifecycle: {error}"));
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::WouldBlock
-                                | io::ErrorKind::TimedOut
-                                | io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(error) => restart_reason = Some(format!("control channel ended: {error}")),
+                }
+            }
+            if STOP_REQUESTED.load(Ordering::Relaxed) {
+                continue;
+            }
+            if restart_reason.is_none() {
+                if let Some(status) = self.worker.as_mut().expect("worker exists").try_wait()? {
+                    restart_reason = Some(format!("worker exited with {status}"));
+                } else {
+                    match self.receive() {
+                        Ok((message, count)) => {
+                            restart_reason = Some(format!(
+                                "unexpected runtime control message {message:?} with {count} descriptors"
+                            ));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            restart_reason = Some(format!("control channel ended: {error}"));
+                        }
+                    }
                 }
             }
             if let Some(reason) = restart_reason {
@@ -125,6 +159,15 @@ impl Runtime {
                 self.cleanup_incarnation()?;
                 if STOP_REQUESTED.load(Ordering::Relaxed) {
                     break;
+                }
+                if let Some((profile, identity)) = replacement {
+                    self.gadget = Path::new(GADGET_ROOT).join(&profile.name);
+                    self.profile = profile;
+                    self.identity = identity;
+                    println!(
+                        "usb-gadget-supervisor: accepted reloaded profile {}",
+                        self.profile.name
+                    );
                 }
                 thread::sleep(Duration::from_millis(250));
                 self.start_incarnation()?;
@@ -179,7 +222,7 @@ impl Runtime {
         self.control
             .as_ref()
             .expect("control channel exists")
-            .set_read_timeout(Some(Duration::from_millis(100)))?;
+            .set_read_timeout(None)?;
         println!(
             "USB gadget profile {} attached through UDC {} as {:04x}:{:04x}; incarnation {} is serving as user {}",
             self.profile.name,
@@ -467,56 +510,116 @@ impl Runtime {
     fn open_resources(&self) -> io::Result<Vec<File>> {
         let mut opened = Vec::new();
         for resource in &self.profile.resources {
-            let metadata = fs::symlink_metadata(&resource.path).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "inspect resource {} at {}: {error}",
-                        resource.name,
-                        resource.path.display()
-                    ),
-                )
-            })?;
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_char_device() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "resource {} at {} must be a non-symlink character device",
-                        resource.name,
-                        resource.path.display()
-                    ),
-                ));
-            }
-            let mut options = OpenOptions::new();
-            match resource.access {
-                ResourceAccess::Read => {
-                    options.read(true);
+            let file = match resource {
+                ResourceProfile::CharacterDevice(resource) => {
+                    self.open_character_device(resource)?
                 }
-                ResourceAccess::Write => {
-                    options.write(true);
-                }
-                ResourceAccess::ReadWrite => {
-                    options.read(true).write(true);
-                }
-            }
-            let file = options.open(&resource.path).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "open resource {} at {}: {error}",
-                        resource.name,
-                        resource.path.display()
-                    ),
-                )
-            })?;
-            println!(
-                "usb-gadget-supervisor: opened required resource {} at {}",
-                resource.name,
-                resource.path.display()
-            );
+                ResourceProfile::GpioLines(resource) => self.request_gpio_lines(resource)?,
+            };
             opened.push(file);
         }
         Ok(opened)
+    }
+
+    fn open_character_device(&self, resource: &CharacterDeviceResource) -> io::Result<File> {
+        validate_character_device(&resource.name, &resource.path)?;
+        let mut options = OpenOptions::new();
+        match resource.access {
+            ResourceAccess::Read => {
+                options.read(true);
+            }
+            ResourceAccess::Write => {
+                options.write(true);
+            }
+            ResourceAccess::ReadWrite => {
+                options.read(true).write(true);
+            }
+        }
+        let file = options.open(&resource.path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "open resource {} at {}: {error}",
+                    resource.name,
+                    resource.path.display()
+                ),
+            )
+        })?;
+        println!(
+            "usb-gadget-supervisor: opened required character-device resource {} at {}",
+            resource.name,
+            resource.path.display()
+        );
+        Ok(file)
+    }
+
+    fn request_gpio_lines(&self, resource: &GpioLinesResource) -> io::Result<File> {
+        use gpiocdev_uapi::v2::{self, LineConfig, LineFlags, LineRequest, LineValues, Offsets};
+
+        validate_character_device(&resource.name, &resource.path)?;
+        let chip = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&resource.path)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "open GPIO chip for resource {} at {}: {error}",
+                        resource.name,
+                        resource.path.display()
+                    ),
+                )
+            })?;
+
+        let mut flags = match resource.direction {
+            GpioDirection::Input => LineFlags::INPUT,
+            GpioDirection::Output => LineFlags::OUTPUT,
+        };
+        if resource.active_low {
+            flags |= LineFlags::ACTIVE_LOW;
+        }
+        flags |= match resource.bias {
+            Some(GpioBias::PullUp) => LineFlags::BIAS_PULL_UP,
+            Some(GpioBias::PullDown) => LineFlags::BIAS_PULL_DOWN,
+            Some(GpioBias::Disabled) => LineFlags::BIAS_DISABLED,
+            None => LineFlags::empty(),
+        };
+        flags |= match resource.edge {
+            Some(GpioEdge::Rising) => LineFlags::EDGE_RISING,
+            Some(GpioEdge::Falling) => LineFlags::EDGE_FALLING,
+            Some(GpioEdge::Both) => LineFlags::EDGE_RISING | LineFlags::EDGE_FALLING,
+            None => LineFlags::empty(),
+        };
+        let mut config = LineConfig {
+            flags,
+            ..Default::default()
+        };
+        if let Some(values) = &resource.initial_values {
+            config.add_values(&LineValues::from_slice(values));
+        }
+        let request = LineRequest {
+            offsets: Offsets::from_slice(&resource.offsets),
+            consumer: resource.name.as_str().into(),
+            config,
+            num_lines: resource.offsets.len() as u32,
+            ..Default::default()
+        };
+        let lines = v2::get_line(&chip, request).map_err(|error| {
+            io::Error::other(format!(
+                "request GPIO resource {} at {} offsets {:?}: {error}",
+                resource.name,
+                resource.path.display(),
+                resource.offsets
+            ))
+        })?;
+        println!(
+            "usb-gadget-supervisor: claimed required GPIO resource {} at {} offsets {:?}",
+            resource.name,
+            resource.path.display(),
+            resource.offsets
+        );
+        Ok(lines)
     }
 
     fn link_functions(&self) -> io::Result<()> {
@@ -576,6 +679,51 @@ impl Runtime {
         )
     }
 
+    fn wait_for_control_activity(&self, signal_fd: i32) -> io::Result<()> {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self
+                    .control
+                    .as_ref()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "worker channel closed")
+                    })?
+                    .as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: signal_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if descriptors[1].revents != 0 {
+            drain_signal_notifications(signal_fd)?;
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        Ok(())
+    }
+
+    fn load_replacement_profile(&self) -> io::Result<(Profile, WorkerIdentity)> {
+        validate_root_owned_file(&self.profile_path, "profile")?;
+        let profile = Profile::load(&self.profile_path)?;
+        let identity = resolve_worker_identity(&profile.worker.run_as)?;
+        validate_worker_executable(&profile.worker.command, &identity)?;
+        for function in &profile.functions {
+            if let FunctionProfile::Hid(hid) = function {
+                if let Some(path) = &hid.report_descriptor {
+                    validate_root_owned_file(path, "HID report descriptor")?;
+                }
+            }
+        }
+        Ok((profile, identity))
+    }
+
     fn unbind(&self) -> io::Result<()> {
         let path = self.gadget.join("UDC");
         if !path.exists() {
@@ -607,12 +755,53 @@ impl Runtime {
     }
 }
 
+fn drain_signal_notifications(descriptor: i32) -> io::Result<()> {
+    let mut bytes = [0_u8; 64];
+    loop {
+        let length =
+            unsafe { libc::read(descriptor, bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) };
+        if length > 0 {
+            continue;
+        }
+        if length == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(error);
+    }
+}
+
 impl Drop for Runtime {
     fn drop(&mut self) {
         if let Err(error) = self.cleanup() {
             eprintln!("usb-gadget-supervisor: cleanup failed: {error}");
         }
     }
+}
+
+fn validate_character_device(name: &str, path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("inspect resource {name} at {}: {error}", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_char_device() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "resource {name} at {} must be a non-symlink character device",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_root_owned_file(path: &Path, label: &str) -> io::Result<()> {

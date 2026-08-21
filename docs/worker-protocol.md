@@ -55,8 +55,9 @@ rather than changing the meaning of an existing slot.
 
 1. for every FunctionFS function, its `ep0` descriptor;
 2. immediately after it, `ep1` through `epN` in descriptor declaration order.
-3. after all FunctionFS descriptors, every `[[resources]]` character-device
-   descriptor in profile order.
+3. after all FunctionFS descriptors, every `[[resources]]` descriptor in
+   profile order. A `gpio-lines` entry contributes the exact line-request
+   descriptor, not its GPIO-chip descriptor.
 
 The supervisor parses the FunctionFS v2 descriptor blob to derive `N`, endpoint
 order, direction, and therefore the safe open mode. The worker and its installed
@@ -72,12 +73,13 @@ Current layouts are:
 | Worker | Pre-bind FDs | Post-bind FDs |
 | --- | --- | --- |
 | Virtual YubiKey | CCID `ep0`, bulk OUT, bulk IN, interrupt IN | FIDO HID |
-| Virtual Trezor | main `ep0`, OUT, IN, display bus, GPIO chip | none |
+| Virtual Trezor | main `ep0`, OUT, IN, display bus, display-control lines, button lines | none |
 
-Profile-declared non-USB character devices such as I2C, SPI, and GPIO are
-opened by the supervisor and transferred in the same pre-bind `SCM_RIGHTS`
-packet. The worker receives authority to the open resources and never receives
-permission to open their paths.
+Profile-declared I2C/SPI devices and exact GPIO line groups are acquired by the
+supervisor and transferred in the same pre-bind `SCM_RIGHTS` packet. GPIO line
+order becomes value-bit order, and an input group with edge detection is itself
+pollable. The worker receives authority to only these open resources and never
+receives permission to open their paths or claim other GPIO lines.
 
 ## Startup sequence
 
@@ -118,6 +120,12 @@ ConfigFS gadget, and constructs a fresh incarnation. A systemd stop performs
 the same incarnation cleanup and then ends the supervisor service. This uses
 process creation as the complete reset boundary instead of trying to repair
 endpoint state inside an old process.
+
+`SIGHUP` transactionally rereads and validates the profile, then requests the
+same clean incarnation rebuild while leaving the supervisor process running.
+An invalid replacement is rejected without disturbing the serving
+incarnation. Worker exit and control EOF continue to rebuild from the already
+accepted in-memory profile.
 
 ## Bootstrap and environment
 

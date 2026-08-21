@@ -66,6 +66,8 @@ configuration and lifecycle.
 - Workers communicate lifecycle state over a small versioned local control
   channel. USB payloads stay on FunctionFS or dedicated HID endpoint files.
 - A worker crash causes immediate UDC unbind before teardown or restart.
+- `systemctl reload` requests the same clean incarnation rebuild without
+  restarting the supervisor process.
 - The supervisor does not pretend that one UDC can expose multiple independent
   USB device identities simultaneously.
 - Software-backed devices are compatibility and development tools, not
@@ -77,7 +79,8 @@ The supervisor:
 
 - load one strictly validated, root-owned device profile;
 - create and tear down ConfigFS gadgets and FunctionFS mounts;
-- open explicitly declared local character devices before dropping privileges;
+- open declared local character devices and claim exact GPIO line groups before
+  dropping privileges;
 - start one worker with inherited endpoint and control descriptors;
 - drop the worker to a configured unprivileged account;
 - bind the gadget only after the worker reports readiness; and

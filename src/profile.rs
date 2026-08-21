@@ -18,11 +18,48 @@ pub(crate) struct Profile {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub(crate) enum ResourceProfile {
+    CharacterDevice(CharacterDeviceResource),
+    GpioLines(GpioLinesResource),
+}
+
+impl ResourceProfile {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::CharacterDevice(resource) => &resource.name,
+            Self::GpioLines(resource) => &resource.name,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::CharacterDevice(resource) => &resource.path,
+            Self::GpioLines(resource) => &resource.path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ResourceProfile {
+pub(crate) struct CharacterDeviceResource {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
     pub(crate) access: ResourceAccess,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GpioLinesResource {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) offsets: Vec<u32>,
+    pub(crate) direction: GpioDirection,
+    #[serde(default)]
+    pub(crate) active_low: bool,
+    pub(crate) bias: Option<GpioBias>,
+    pub(crate) edge: Option<GpioEdge>,
+    pub(crate) initial_values: Option<Vec<bool>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -31,6 +68,29 @@ pub(crate) enum ResourceAccess {
     Read,
     Write,
     ReadWrite,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GpioDirection {
+    Input,
+    Output,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GpioBias {
+    PullUp,
+    PullDown,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GpioEdge {
+    Rising,
+    Falling,
+    Both,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -153,21 +213,83 @@ impl Profile {
         }
 
         let mut resource_names = HashSet::new();
-        let mut resource_paths = HashSet::new();
+        let mut character_device_paths = HashSet::new();
+        let mut gpio_lines = HashSet::new();
         for resource in &self.resources {
-            validate_name("resource", &resource.name)?;
-            if !resource_names.insert(resource.name.as_str()) {
-                return invalid(format!("duplicate resource name {:?}", resource.name));
+            validate_name("resource", resource.name())?;
+            if !resource_names.insert(resource.name()) {
+                return invalid(format!("duplicate resource name {:?}", resource.name()));
             }
-            validate_absolute("resource path", &resource.path)?;
-            if resource.path == Path::new("/dev") || !resource.path.starts_with("/dev") {
+            validate_absolute("resource path", resource.path())?;
+            if resource.path() == Path::new("/dev") || !resource.path().starts_with("/dev") {
                 return invalid("resource paths must be strict children of /dev");
             }
-            if !resource_paths.insert(resource.path.as_path()) {
-                return invalid(format!(
-                    "duplicate resource path {}",
-                    resource.path.display()
-                ));
+            match resource {
+                ResourceProfile::CharacterDevice(resource) => {
+                    if is_gpio_chip_path(&resource.path) {
+                        return invalid(format!(
+                            "GPIO chip {} must be declared as a gpio-lines resource",
+                            resource.path.display()
+                        ));
+                    }
+                    if !character_device_paths.insert(resource.path.as_path()) {
+                        return invalid(format!(
+                            "duplicate character-device resource path {}",
+                            resource.path.display()
+                        ));
+                    }
+                }
+                ResourceProfile::GpioLines(resource) => {
+                    if !is_gpio_chip_path(&resource.path) {
+                        return invalid(
+                            "GPIO line resources must use the /dev/gpiochipN namespace",
+                        );
+                    }
+                    if resource.offsets.is_empty() || resource.offsets.len() > 64 {
+                        return invalid("GPIO line groups must contain 1 to 64 offsets");
+                    }
+                    let mut offsets = HashSet::new();
+                    for offset in &resource.offsets {
+                        if !offsets.insert(*offset) {
+                            return invalid(format!(
+                                "GPIO resource {:?} contains duplicate offset {offset}",
+                                resource.name
+                            ));
+                        }
+                        if !gpio_lines.insert((resource.path.as_path(), *offset)) {
+                            return invalid(format!(
+                                "GPIO line {}:{} is claimed by more than one resource",
+                                resource.path.display(),
+                                offset
+                            ));
+                        }
+                    }
+                    match resource.direction {
+                        GpioDirection::Input => {
+                            if resource.initial_values.is_some() {
+                                return invalid("input GPIO line groups cannot set initial_values");
+                            }
+                        }
+                        GpioDirection::Output => {
+                            if resource.bias.is_some() || resource.edge.is_some() {
+                                return invalid("output GPIO line groups cannot set bias or edge");
+                            }
+                            match &resource.initial_values {
+                                Some(values) if values.len() == resource.offsets.len() => {}
+                                Some(_) => {
+                                    return invalid(
+                                        "GPIO output initial_values must match offsets in length",
+                                    );
+                                }
+                                None => {
+                                    return invalid(
+                                        "GPIO output line groups must set initial_values",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -267,6 +389,16 @@ fn validate_name(label: &str, value: &str) -> io::Result<()> {
         return invalid(format!("invalid {label} name {value:?}"));
     }
     Ok(())
+}
+
+fn is_gpio_chip_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.parent() == Some(Path::new("/dev"))
+        && name.strip_prefix("gpiochip").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn validate_absolute(label: &str, path: &Path) -> io::Result<()> {
@@ -438,7 +570,7 @@ strings_hex = "02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00"
     #[test]
     fn parses_required_device_resources() {
         let source = format!(
-            "{VALID}\n[[resources]]\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\n"
+            "{VALID}\n[[resources]]\ntype = \"character-device\"\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\n"
         );
         let profile: Profile = toml::from_str(&source).unwrap();
         profile.validate().unwrap();
@@ -448,8 +580,58 @@ strings_hex = "02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00"
     #[test]
     fn rejects_optional_resource_slots() {
         let source = format!(
-            "{VALID}\n[[resources]]\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\noptional = true\n"
+            "{VALID}\n[[resources]]\ntype = \"character-device\"\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\noptional = true\n"
         );
         assert!(toml::from_str::<Profile>(&source).is_err());
+    }
+
+    #[test]
+    fn accepts_disjoint_gpio_groups_on_one_chip() {
+        let source = format!(
+            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"display-control\"\npath = \"/dev/gpiochip0\"\noffsets = [25, 27, 24]\ndirection = \"output\"\ninitial_values = [false, false, false]\n\n[[resources]]\ntype = \"gpio-lines\"\nname = \"buttons\"\npath = \"/dev/gpiochip0\"\noffsets = [5, 26, 13]\ndirection = \"input\"\nactive_low = true\nbias = \"pull-up\"\nedge = \"both\"\n"
+        );
+        let profile: Profile = toml::from_str(&source).unwrap();
+        profile.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_overlapping_gpio_groups() {
+        let source = format!(
+            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"first\"\npath = \"/dev/gpiochip0\"\noffsets = [5, 26]\ndirection = \"input\"\n\n[[resources]]\ntype = \"gpio-lines\"\nname = \"second\"\npath = \"/dev/gpiochip0\"\noffsets = [26, 13]\ndirection = \"input\"\n"
+        );
+        assert!(toml::from_str::<Profile>(&source)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn requires_one_initial_value_per_output_line() {
+        let missing = format!(
+            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"display-control\"\npath = \"/dev/gpiochip0\"\noffsets = [24, 25]\ndirection = \"output\"\n"
+        );
+        assert!(toml::from_str::<Profile>(&missing)
+            .unwrap()
+            .validate()
+            .is_err());
+
+        let wrong_count = format!(
+            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"display-control\"\npath = \"/dev/gpiochip0\"\noffsets = [24, 25]\ndirection = \"output\"\ninitial_values = [false]\n"
+        );
+        assert!(toml::from_str::<Profile>(&wrong_count)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_a_raw_gpio_chip_character_device() {
+        let source = format!(
+            "{VALID}\n[[resources]]\ntype = \"character-device\"\nname = \"gpio\"\npath = \"/dev/gpiochip0\"\naccess = \"read-write\"\n"
+        );
+        assert!(toml::from_str::<Profile>(&source)
+            .unwrap()
+            .validate()
+            .is_err());
     }
 }

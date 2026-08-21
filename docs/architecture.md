@@ -65,6 +65,13 @@ The kernel remains the final USB semantic validator. The supervisor parser adds
 early diagnostics, derives the exact resource bundle, and prevents a mismatch
 between the profile and the endpoints it hands to a worker.
 
+Local hardware follows the same capability model. The supervisor opens I2C or
+SPI character devices and uses the GPIO v2 API to claim profile-declared line
+groups. It transfers exact GPIO line-request handles rather than GPIO-chip
+handles, so a worker can operate or poll only its assigned lines. Profile
+offset order defines the handle's bit order, and overlapping GPIO claims are
+rejected before the worker starts.
+
 ConfigFS HID functions are different: their report descriptor is written to
 the ConfigFS function before binding, but `/dev/hidgN` appears only after the
 UDC is bound. Those FDs therefore form a second, post-bind bundle.
