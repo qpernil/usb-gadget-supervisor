@@ -34,26 +34,6 @@ struct WorkerIdentity {
     gid: u32,
 }
 
-enum ResourceHandle {
-    File(File),
-    Gpio(gpiocdev::Request),
-}
-
-impl AsRawFd for ResourceHandle {
-    fn as_raw_fd(&self) -> i32 {
-        match self {
-            Self::File(file) => file.as_raw_fd(),
-            Self::Gpio(request) => request.as_raw_fd(),
-        }
-    }
-}
-
-impl From<File> for ResourceHandle {
-    fn from(file: File) -> Self {
-        Self::File(file)
-    }
-}
-
 pub(crate) struct Runtime {
     profile_path: PathBuf,
     profile: Profile,
@@ -404,7 +384,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn publish_and_open_functionfs(&self) -> io::Result<Vec<ResourceHandle>> {
+    fn publish_and_open_functionfs(&self) -> io::Result<Vec<File>> {
         let mut files = Vec::new();
         for function in &self.profile.functions {
             let FunctionProfile::Functionfs(ffs) = function else {
@@ -426,7 +406,7 @@ impl Runtime {
                 .open(ffs.mount.join("ep0"))?;
             ep0.write_all(&descriptors)?;
             ep0.write_all(&strings)?;
-            files.push(ep0.into());
+            files.push(ep0);
             for (index, endpoint) in endpoints.iter().enumerate() {
                 let path = ffs.mount.join(format!("ep{}", index + 1));
                 let metadata = fs::symlink_metadata(&path)?;
@@ -448,7 +428,7 @@ impl Runtime {
                         options.write(true);
                     }
                 }
-                files.push(options.custom_flags(libc::O_NONBLOCK).open(path)?.into());
+                files.push(options.custom_flags(libc::O_NONBLOCK).open(path)?);
             }
             println!(
                 "usb-gadget-supervisor: published FunctionFS {} with {} data endpoints",
@@ -459,7 +439,7 @@ impl Runtime {
         Ok(files)
     }
 
-    fn spawn_worker(&mut self, prebind: &[ResourceHandle]) -> io::Result<()> {
+    fn spawn_worker(&mut self, prebind: &[File]) -> io::Result<()> {
         let (mut supervisor, worker_control) = seqpacket_pair()?;
         supervisor.set_read_timeout(Some(Duration::from_millis(
             self.profile.worker.readiness_timeout_ms,
@@ -527,16 +507,14 @@ impl Runtime {
         Ok(())
     }
 
-    fn open_resources(&self) -> io::Result<Vec<ResourceHandle>> {
+    fn open_resources(&self) -> io::Result<Vec<File>> {
         let mut opened = Vec::new();
         for resource in &self.profile.resources {
             let handle = match resource {
                 ResourceProfile::CharacterDevice(resource) => {
-                    self.open_character_device(resource)?.into()
+                    self.open_character_device(resource)?
                 }
-                ResourceProfile::GpioLines(resource) => {
-                    ResourceHandle::Gpio(self.request_gpio_lines(resource)?)
-                }
+                ResourceProfile::GpioLines(resource) => self.request_gpio_lines(resource)?,
             };
             opened.push(handle);
         }
@@ -575,48 +553,26 @@ impl Runtime {
         Ok(file)
     }
 
-    fn request_gpio_lines(&self, resource: &GpioLinesResource) -> io::Result<gpiocdev::Request> {
-        use gpiocdev::line::{Bias, EdgeDetection};
-        use gpiocdev::Request;
+    fn request_gpio_lines(&self, resource: &GpioLinesResource) -> io::Result<File> {
+        use gpiocdev_uapi::v2;
 
         validate_character_device(&resource.name, &resource.path)?;
-        let mut builder = Request::builder();
-        builder
-            .on_chip(&resource.path)
-            .with_consumer(&resource.name);
-        match resource.direction {
-            GpioDirection::Input => {
-                builder.with_lines(&resource.offsets).as_input();
-            }
-            GpioDirection::Output => {
-                configure_gpio_outputs(
-                    &mut builder,
-                    &resource.offsets,
-                    resource
-                        .initial_values
-                        .as_ref()
-                        .expect("validated GPIO outputs have initial values"),
-                );
-            }
-        }
-        if resource.active_low {
-            builder.as_active_low();
-        }
-        if let Some(bias) = resource.bias {
-            builder.with_bias(match bias {
-                GpioBias::PullUp => Bias::PullUp,
-                GpioBias::PullDown => Bias::PullDown,
-                GpioBias::Disabled => Bias::Disabled,
-            });
-        }
-        if let Some(edge) = resource.edge {
-            builder.with_edge_detection(match edge {
-                GpioEdge::Rising => EdgeDetection::RisingEdge,
-                GpioEdge::Falling => EdgeDetection::FallingEdge,
-                GpioEdge::Both => EdgeDetection::BothEdges,
-            });
-        }
-        let request = builder.request().map_err(|error| {
+        let chip = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&resource.path)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "open GPIO chip for resource {} at {}: {error}",
+                        resource.name,
+                        resource.path.display()
+                    ),
+                )
+            })?;
+
+        let lines = v2::get_line(&chip, gpio_line_request(resource)).map_err(|error| {
             io::Error::other(format!(
                 "request GPIO resource {} at {} offsets {:?}: {error}",
                 resource.name,
@@ -630,7 +586,7 @@ impl Runtime {
             resource.path.display(),
             resource.offsets
         );
-        Ok(request)
+        Ok(lines)
     }
 
     fn link_functions(&self) -> io::Result<()> {
@@ -766,49 +722,73 @@ impl Runtime {
     }
 }
 
-fn configure_gpio_outputs(
-    builder: &mut gpiocdev::request::Builder,
-    offsets: &[u32],
-    initial_values: &[bool],
-) {
-    use gpiocdev::line::Value;
+fn gpio_line_request(resource: &GpioLinesResource) -> gpiocdev_uapi::v2::LineRequest {
+    use gpiocdev_uapi::v2::{LineConfig, LineFlags, LineRequest, LineValues, Offsets};
 
-    builder.with_lines(offsets).as_output(Value::Inactive);
-    for (offset, value) in offsets.iter().zip(initial_values) {
-        builder.with_line(*offset).with_value(Value::from(*value));
+    let mut flags = match resource.direction {
+        GpioDirection::Input => LineFlags::INPUT,
+        GpioDirection::Output => LineFlags::OUTPUT,
+    };
+    if resource.active_low {
+        flags |= LineFlags::ACTIVE_LOW;
+    }
+    flags |= match resource.bias {
+        Some(GpioBias::PullUp) => LineFlags::BIAS_PULL_UP,
+        Some(GpioBias::PullDown) => LineFlags::BIAS_PULL_DOWN,
+        Some(GpioBias::Disabled) => LineFlags::BIAS_DISABLED,
+        None => LineFlags::empty(),
+    };
+    flags |= match resource.edge {
+        Some(GpioEdge::Rising) => LineFlags::EDGE_RISING,
+        Some(GpioEdge::Falling) => LineFlags::EDGE_FALLING,
+        Some(GpioEdge::Both) => LineFlags::EDGE_RISING | LineFlags::EDGE_FALLING,
+        None => LineFlags::empty(),
+    };
+    let mut config = LineConfig {
+        flags,
+        ..Default::default()
+    };
+    if let Some(values) = &resource.initial_values {
+        config.add_values(&LineValues::from_slice(values));
+    }
+    LineRequest {
+        offsets: Offsets::from_slice(&resource.offsets),
+        consumer: resource.name.as_str().into(),
+        config,
+        num_lines: resource.offsets.len() as u32,
+        ..Default::default()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::configure_gpio_outputs;
-    use gpiocdev::line::{Direction, Value};
-    use gpiocdev::Request;
+mod gpio_tests {
+    use super::gpio_line_request;
+    use crate::profile::{GpioDirection, GpioLinesResource};
+    use gpiocdev_uapi::v2::LineAttributeValue;
+    use std::path::PathBuf;
 
     #[test]
-    fn gpio_outputs_preserve_profile_order_and_values() {
-        let mut builder = Request::builder();
-        configure_gpio_outputs(&mut builder, &[25, 27, 24], &[false, true, false]);
+    fn request_preserves_profile_order_and_value_bits() {
+        let resource = GpioLinesResource {
+            name: "display-control".into(),
+            path: PathBuf::from("/dev/gpiochip0"),
+            offsets: vec![25, 27, 24],
+            direction: GpioDirection::Output,
+            active_low: false,
+            bias: None,
+            edge: None,
+            initial_values: Some(vec![false, true, false]),
+        };
 
-        let config = builder.config();
-        assert_eq!(config.lines(), &[25, 27, 24]);
+        let request = gpio_line_request(&resource);
+        assert_eq!(request.num_lines, 3);
+        assert_eq!(request.offsets.get(0), 25);
+        assert_eq!(request.offsets.get(1), 27);
+        assert_eq!(request.offsets.get(2), 24);
+        assert_eq!(request.config.attr(0).mask, 0b111);
         assert_eq!(
-            config
-                .line_config(25)
-                .map(|line| (line.direction, line.value)),
-            Some((Some(Direction::Output), Some(Value::Inactive)))
-        );
-        assert_eq!(
-            config
-                .line_config(27)
-                .map(|line| (line.direction, line.value)),
-            Some((Some(Direction::Output), Some(Value::Active)))
-        );
-        assert_eq!(
-            config
-                .line_config(24)
-                .map(|line| (line.direction, line.value)),
-            Some((Some(Direction::Output), Some(Value::Inactive)))
+            request.config.attr(0).attr.to_value(),
+            Some(LineAttributeValue::Values(0b010))
         );
     }
 }
