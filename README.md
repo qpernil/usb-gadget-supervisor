@@ -77,6 +77,19 @@ WebUSB declarations travel in the same object.
 - Software-backed devices are compatibility and development tools, not
   substitutes for tamper-resistant hardware.
 
+Reload a running instance through its unit so systemd executes the template's
+`ExecReload` action and signals only the supervisor main process:
+
+```sh
+sudo systemctl reload usb-gadget-supervisor@virtual-trezor-st7789.service
+```
+
+Do not substitute plain `systemctl kill -s HUP`: its default target is the
+unit cgroup, so it can signal the worker as well as the supervisor. The
+supervisor's SIGHUP path intentionally keeps its own PID, retires the old USB
+generation and worker cleanly, reloads the profile, and creates a fresh
+generation.
+
 ## Scope
 
 The supervisor:
