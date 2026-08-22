@@ -1,152 +1,171 @@
-# Worker Protocol
+# Worker protocol
 
-## Purpose
+## Transport
 
-The worker protocol gives an unprivileged device worker an immutable set of already-open
-USB resources. The worker never opens FunctionFS mounts, `/dev/hidgN`, ConfigFS,
-or the UDC attribute. Normal USB payloads travel through the transferred file
-descriptors, not through the control socket.
+The supervisor creates an `AF_UNIX` `SOCK_SEQPACKET` pair and duplicates the
+worker end onto file descriptor 3. Packet boundaries preserve records and
+`SCM_RIGHTS` carries local-resource and endpoint-proxy capabilities.
 
-Supervisor, profile, and worker are deployed as one matched set.
-
-## Transport and encoding
-
-The supervisor creates a local `AF_UNIX` `SOCK_SEQPACKET` socket pair. It
-duplicates the worker end onto fixed file descriptor 3 before `exec`. Packet boundaries remove
-the need for a stream decoder, and `SCM_RIGHTS` ancillary data carries open file
-descriptions independently of the eight-byte normal-data record.
+Every record starts with this 20-byte header:
 
 | Offset | Size | Meaning |
-| --- | --- | --- |
-| 0 | 4 | ASCII magic `UGSP` |
-| 4 | 1 | Protocol version `1` |
-| 5 | 1 | Message type |
-| 6 | 2 | Big-endian exact count of attached file descriptors |
+| ---: | ---: | --- |
+| 0 | 4 | ASCII `UGSP` (`USB Gadget Supervisor Protocol`) |
+| 4 | 1 | version `1` |
+| 5 | 1 | message kind |
+| 6 | 2 | big-endian attached-FD count |
+| 8 | 4 | big-endian USB generation |
+| 12 | 4 | big-endian request ID |
+| 16 | 4 | big-endian body length |
 
-The count is part of the validation contract. Truncated packets, ancillary
-truncation, unexpected ancillary types, unknown messages, wrong counts, and EOF
-during startup fail closed.
+The body immediately follows. Its maximum length is 1 MiB. Wrong lengths,
+unknown kinds, truncated ancillary data, and mismatched FD counts fail closed.
 
 ## Messages
 
-| Direction | Message | Value | FD count |
-| --- | --- | ---: | ---: |
-| Supervisor → worker | `PREBIND_RESOURCES` | `0x01` | Profile-derived |
-| Supervisor → worker | `POSTBIND_RESOURCES` | `0x02` | Profile-derived |
-| Worker → supervisor | `PREPARED` | `0x81` | 0 |
-| Worker → supervisor | `SERVING` | `0x82` | 0 |
+| Direction | Kind | Value | Body / descriptors |
+| --- | --- | ---: | --- |
+| supervisor → worker | `InitialResources` | `0x01` | named local resources + matching FDs |
+| supervisor → worker | `UsbEndpoints` | `0x02` | endpoint map + one proxy FD per entry |
+| supervisor → worker | `UsbBusEvent` | `0x03` | one lifecycle-event byte |
+| supervisor → worker | `UsbControlRequest` | `0x04` | setup packet + optional OUT data |
+| supervisor → worker | `Quiesce` | `0x11` | empty |
+| supervisor → worker | `ConfigurationRejected` | `0x12` | diagnostic UTF-8 text |
+| worker → supervisor | `Configure` | `0x80` | schema-1 `UsbPersonality` CBOR |
+| worker → supervisor | `UsbControlResponse` | `0x81` | disposition + optional IN data |
+| worker → supervisor | `Serving` | `0x82` | empty |
+| worker → supervisor | `Quiesced` | `0x84` | empty |
 
-There are no shutdown, detach, fatal, stopped, or reconnect messages. After
-`SERVING`, the socket remains open only as a liveness relationship:
+Worker configuration requests and supervisor control requests use nonzero
+request IDs. Replies carry the matching ID. The generation is zero before the
+first accepted configuration of a worker process and increments whenever the
+supervisor creates replacement USB state.
 
-- supervisor EOF tells the worker to exit;
-- worker EOF or process exit tells the supervisor to rebuild the incarnation;
-- a firmware `usbReconnect()` operation ends the worker process, producing the
-  same clean rebuild as any other worker exit.
+## Initial resources
 
-## Fixed resource order
-
-The magic/version selects one fixed layout. No per-descriptor identifiers or
-nullable slots are encoded. Profile resources are therefore mandatory. A
-future optional resource would need a separate explicitly versioned message
-rather than changing the meaning of an existing slot.
-
-`PREBIND_RESOURCES` contains, in profile function order:
-
-1. for every FunctionFS function, its `ep0` descriptor;
-2. immediately after it, `ep1` through `epN` in descriptor declaration order.
-3. after all FunctionFS descriptors, every `[[resources]]` descriptor in
-   profile order. A `gpio-lines` entry contributes the exact line-request
-   descriptor, not its GPIO-chip descriptor.
-
-The supervisor parses the FunctionFS v2 descriptor blob to derive `N`, endpoint
-order, direction, and therefore the safe open mode. The worker and its installed
-profile are one versioned device contract, so the worker knows the semantic
-meaning of each position.
-
-`POSTBIND_RESOURCES` contains one open HID gadget descriptor for every ConfigFS
-HID function, again in profile order. HID nodes exist only after UDC binding,
-which is why this second transfer is necessary.
-
-Current layouts are:
-
-| Worker | Pre-bind FDs | Post-bind FDs |
-| --- | --- | --- |
-| Virtual YubiKey | CCID `ep0`, bulk OUT, bulk IN, interrupt IN | FIDO HID |
-| Virtual Trezor | main `ep0`, OUT, IN, display bus, display-control lines, button lines | none |
-
-Profile-declared I2C/SPI devices and exact GPIO line groups are acquired by the
-supervisor and transferred in the same pre-bind `SCM_RIGHTS` packet. GPIO line
-order becomes value-bit order, and an input group with edge detection is itself
-pollable. The worker receives authority to only these open resources and never
-receives permission to open their paths or claim other GPIO lines.
-
-## Startup sequence
-
-1. The supervisor validates the root-owned schema-1 profile and FunctionFS
-   blobs.
-2. It creates the unbound ConfigFS gadget and root-only FunctionFS mounts.
-3. It writes each function's descriptors and strings to `ep0`.
-4. It opens every resulting endpoint with direction-appropriate access and
-   every required local hardware resource with its declared access mode.
-5. It starts the unprivileged worker and sends `PREBIND_RESOURCES` with
-   `SCM_RIGHTS`.
-6. The worker validates the exact layout, initializes state, and sends
-   `PREPARED`.
-7. The supervisor links functions and binds the selected UDC.
-8. It opens post-bind HID nodes and sends `POSTBIND_RESOURCES` (including an
-   explicit zero-FD packet when there are none).
-9. The worker sends `SERVING` and begins its transport loops.
-
-The worker retains FunctionFS `ep0` because it still receives runtime
-`BIND`, `ENABLE`, `DISABLE`, `UNBIND`, `SUSPEND`, `RESUME`, and `SETUP` events.
-It does not use `ep0` to publish descriptors; that setup operation is already
-complete before the FD is transferred.
-
-## Incarnations and cleanup
-
-The supervisor process owns the long-lived service. A worker process is one
-short-lived incarnation with an immutable resource bundle:
+`InitialResources` uses generation and request ID zero. Its body is:
 
 ```text
-prepare -> worker PREPARED -> bind -> worker SERVING -> serving
-   ^                                                |
-   +------ unbind, clean, create new process <------+ worker exit/EOF
+u16 name_count
+repeat name_count times:
+    u16 UTF-8 name length
+    bytes name
 ```
 
-On worker exit or control EOF, the supervisor unbinds first, closes its control
-socket, waits briefly for worker termination, unmounts FunctionFS, removes the
-ConfigFS gadget, and constructs a fresh incarnation. A systemd stop performs
-the same incarnation cleanup and then ends the supervisor service. This uses
-process creation as the complete reset boundary instead of trying to repair
-endpoint state inside an old process.
+The record carries exactly one FD per name in profile order. A GPIO entry
+contributes its line-request FD, not its GPIO-chip FD.
 
-`SIGHUP` transactionally rereads and validates the profile, then requests the
-same clean incarnation rebuild while leaving the supervisor process running.
-An invalid replacement is rejected without disturbing the serving
-incarnation. Worker exit and control EOF continue to rebuild from the already
-accepted in-memory profile.
+## USB personality
 
-## Bootstrap and environment
+The `Configure` body is CBOR produced from the typed `UsbPersonality` in the
+shared `usb-gadget-worker` crate. It represents the USB-facing configuration
+that formerly lived in the installed text profile; it is not a transcript of
+control requests.
 
-The control socket is always descriptor 3. The supervisor clears the
-environment and supplies only the two ordinary path settings:
+The public C surface is intentionally small:
 
-| Variable | Meaning |
-| --- | --- |
-| `USB_GADGET_STATE_DIRECTORY` | Persistent worker-owned state directory |
-| `USB_GADGET_RUNTIME_DIRECTORY` | Volatile worker runtime directory |
+```c
+bool ugsp_discover_usb_personality(
+    uint8_t speed, ugsp_control_transfer_fn transfer, void *context,
+    uint8_t **output, size_t *output_length);
 
-There are no descriptor-number, FunctionFS, HID, or local-device path
-environment variables.
+void ugsp_personality_cbor_free(uint8_t *bytes, size_t length);
+```
+
+Discovery issues standard, Microsoft OS, and WebUSB control transfers through
+the callback, parses the answers, and returns the final CBOR object. A native
+worker may instead construct the Rust object or retain a static CBOR blob.
+
+## Endpoint proxies
+
+`UsbEndpoints` contains this body and exactly one proxy FD per entry:
+
+```text
+u16 endpoint_count
+repeat endpoint_count times:
+    u8 endpoint_address
+    u8 transfer_type
+    u16 max_packet_size
+```
+
+Each FD is a nonblocking `SOCK_SEQPACKET` socket. One socket message represents
+one USB packet and has this framing:
+
+```text
+u16 big-endian packet_length
+packet_length bytes
+```
+
+The explicit length distinguishes a USB zero-length packet from socket EOF.
+The supervisor owns the blocking FunctionFS endpoint file and a generation-
+scoped pump copies complete packets between it and the proxy. The worker can
+therefore poll all endpoint proxies, the control channel, GPIO, and its own
+timer in one thread without knowing FunctionFS blocking rules.
+
+## Control endpoint
+
+The supervisor owns FunctionFS `ep0`. A `UsbControlRequest` body contains the
+eight setup bytes followed by exactly `wLength` bytes for an OUT request, or no
+data for an IN request. The response begins with one disposition byte:
+
+| Value | Meaning | Remaining body |
+| ---: | --- | --- |
+| `0` | stall | empty |
+| `1` | acknowledge an OUT request | empty |
+| `2` | answer an IN request | response bytes, clipped to `wLength` |
+
+If the kernel cancels a pending setup because a newer setup or lifecycle event
+supersedes it, the supervisor discards only that transaction and continues
+serving. Cancellation is not a worker or gadget failure.
+
+## Bus lifecycle
+
+`UsbBusEvent` carries one of the seven stable values below. The supervisor
+translates the FunctionFS event stream into this abstraction and remains the
+only process that reads `ep0`.
+
+| Value | Event | Worker meaning |
+| ---: | --- | --- |
+| `0` | `Bind` | controller function has been bound; reset controller state |
+| `1` | `Unbind` | gadget generation is being removed |
+| `2` | `Enable` | host selected a configuration/interface; endpoints may transfer |
+| `3` | `Disable` | configuration disappeared; reset and stop endpoint use |
+| `4` | `Setup` | represented by `UsbControlRequest`, never sent as `UsbBusEvent` |
+| `5` | `Suspend` | retain configuration and state; invoke firmware suspend handling |
+| `6` | `Resume` | resume the same configuration; invoke firmware resume handling |
+
+Endpoint pumps run only while enabled. Suspend does not disable them or change
+the USB generation. See [USB lifecycle](usb-lifecycle.md) for host sleep,
+reset, disconnect, and power-loss behavior.
+
+## Startup and reconfiguration
+
+Startup is:
+
+1. Supervisor starts the unprivileged worker and sends `InitialResources`.
+2. Worker publishes `Configure(generation=0, request_id>0)`.
+3. Supervisor validates and logs the personality, builds ConfigFS/FunctionFS,
+   and creates the endpoint pumps.
+4. Supervisor sends `UsbEndpoints(generation=1)` with proxy FDs.
+5. Worker installs them and returns `Serving`; supervisor binds the UDC.
+6. Runtime bus, control, and packet traffic uses the records and proxies above.
+
+For `usbReconnect()` or a personality change, the same worker sends another
+complete `Configure`. After validating it, the supervisor requests `Quiesce`,
+unbinds and removes the old generation, builds the next generation, sends new
+proxy FDs, waits for `Serving`, and rebinds. The host sees a physical-style
+disconnect and full re-enumeration while firmware state survives.
+
+`SIGHUP` deliberately has the broader meaning: re-read the root-owned profile,
+tear down the current generation and worker, and start a fresh worker. Worker
+exit or control-channel EOF takes the same fresh-incarnation recovery path.
 
 ## Data path
 
 ```text
-host OUT -> UDC/kernel -> open OUT fd -> worker protocol decoder
-host IN  <- UDC/kernel <- open IN fd  <- worker protocol encoder
+host OUT -> UDC/kernel -> FunctionFS -> supervisor pump -> worker proxy
+host IN  <- UDC/kernel <- FunctionFS <- supervisor pump <- worker proxy
 ```
 
-The root supervisor is absent from this data path. It handles descriptor
-metadata and lifecycle but never proxies CTAP, CCID, Trezor, or vendor-bulk
-payloads.
+The privileged code preserves packets but does not parse Trezor, CCID, CTAP,
+or YubiHSM payloads.

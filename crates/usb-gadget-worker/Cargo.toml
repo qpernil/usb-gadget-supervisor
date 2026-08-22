@@ -1,0 +1,16 @@
+[package]
+name = "usb-gadget-worker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Worker-side USB personality model for usb-gadget-supervisor"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+ciborium = "0.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_bytes = "0.11.19"

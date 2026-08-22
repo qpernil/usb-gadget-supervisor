@@ -1,19 +1,18 @@
-//! Privileged Linux ConfigFS, FunctionFS, UDC, and worker lifecycle.
+//! Privileged ConfigFS projection of a worker-owned USB device.
 
 use crate::functionfs::{self, Direction};
 use crate::profile::{
-    decode_hex_blob, decode_hex_descriptor, CharacterDeviceResource, FunctionProfile, GpioBias,
-    GpioDirection, GpioEdge, GpioLinesResource, HidFunction, Profile, ResourceAccess,
-    ResourceProfile,
+    CharacterDeviceResource, GpioBias, GpioDirection, GpioEdge, GpioLinesResource, Profile,
+    ResourceAccess, ResourceProfile,
 };
-use crate::protocol::{
-    Message, CONTROL_FD, PACKET_LENGTH, RUNTIME_DIRECTORY_ENV, STATE_DIRECTORY_ENV,
-};
+use crate::protocol::{self, Kind, Record, CONTROL_FD, RUNTIME_DIRECTORY_ENV, STATE_DIRECTORY_ENV};
+use crate::usb_personality::{self, Personality};
 use crate::{RESTART_REQUESTED, STOP_REQUESTED};
 use std::ffi::{c_void, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::net::Shutdown;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{chown, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -21,18 +20,43 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const CONFIGFS: &str = "/sys/kernel/config";
 const GADGET_ROOT: &str = "/sys/kernel/config/usb_gadget";
 const LOCK_FILE: &str = "/run/lock/usb-gadget-supervisor.lock";
+const DEBUG_BUNDLE_ROOT: &str = "/run/usb-gadget-supervisor";
 
 struct WorkerIdentity {
     name: String,
     uid: u32,
     gid: u32,
 }
+
+struct UsbGeneration {
+    ep0: File,
+    endpoint_pumps: Vec<JoinHandle<()>>,
+    pump_controls: Vec<UnixStream>,
+    pump_lifecycle: Arc<(Mutex<PumpLifecycle>, Condvar)>,
+    endpoint_failure: File,
+}
+
+#[derive(Default)]
+struct PumpLifecycle {
+    enabled: bool,
+    stopping: bool,
+    epoch: u64,
+}
+
+type EndpointProxies = (
+    Vec<UnixStream>,
+    Vec<JoinHandle<()>>,
+    Vec<UnixStream>,
+    Arc<(Mutex<PumpLifecycle>, Condvar)>,
+    File,
+);
 
 pub(crate) struct Runtime {
     profile_path: PathBuf,
@@ -42,11 +66,13 @@ pub(crate) struct Runtime {
     _lock: File,
     configfs_mounted_by_us: bool,
     owns_gadget: bool,
-    mounted_functionfs: Vec<PathBuf>,
+    functionfs_mounted: bool,
     worker: Option<Child>,
     control: Option<UnixStream>,
-    udc: Option<String>,
-    incarnation: u64,
+    usb: Option<UsbGeneration>,
+    udc: String,
+    generation: u32,
+    next_control_request: u32,
     cleaned: bool,
 }
 
@@ -59,24 +85,16 @@ impl Runtime {
         if unsafe { libc::geteuid() } != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "USB gadget setup needs root; run the supervisor through systemd or sudo",
+                "USB gadget setup needs root",
             ));
         }
-
         validate_root_owned_file(&profile_path, "profile")?;
         let identity = resolve_worker_identity(&profile.worker.run_as)?;
         validate_worker_executable(&profile.worker.command, &identity)?;
-        for function in &profile.functions {
-            if let FunctionProfile::Hid(hid) = function {
-                if let Some(path) = &hid.report_descriptor {
-                    validate_root_owned_file(path, "HID report descriptor")?;
-                }
-            }
-        }
-
         let lock = acquire_lock()?;
         let configfs_mounted_by_us = ensure_configfs()?;
         let gadget = Path::new(GADGET_ROOT).join(&profile.name);
+        let udc = select_udc(requested_udc)?;
         let mut runtime = Self {
             profile_path,
             profile,
@@ -85,92 +103,107 @@ impl Runtime {
             _lock: lock,
             configfs_mounted_by_us,
             owns_gadget: false,
-            mounted_functionfs: Vec::new(),
+            functionfs_mounted: false,
             worker: None,
             control: None,
-            udc: Some(select_udc(requested_udc)?),
-            incarnation: 0,
+            usb: None,
+            udc,
+            generation: 0,
+            next_control_request: 1,
             cleaned: false,
         };
-
         runtime.cleanup_stale_state()?;
-        runtime.start_incarnation()?;
+        runtime.start_worker()?;
+        let configuration = protocol::receive(runtime.control.as_ref().unwrap())?;
+        runtime.configure(configuration, true)?;
         Ok(runtime)
     }
 
     pub(crate) fn serve(&mut self, signal_fd: i32) -> io::Result<()> {
         while !STOP_REQUESTED.load(Ordering::Relaxed) {
-            let mut replacement = None;
-            let mut restart_reason = None;
-            if RESTART_REQUESTED.swap(false, Ordering::Relaxed) {
-                match self.load_replacement_profile() {
-                    Ok(loaded) => {
-                        replacement = Some(loaded);
-                        restart_reason =
-                            Some("SIGHUP requested a validated profile reload".to_owned());
+            if let Some(status) = self.worker.as_mut().expect("worker exists").try_wait()? {
+                eprintln!("usb-gadget-supervisor: worker exited with {status}; restarting");
+                self.restart_worker()?;
+                continue;
+            }
+            let control = self.control.as_ref().expect("control exists").as_raw_fd();
+            let ep0 = self
+                .usb
+                .as_ref()
+                .map_or(-1, |generation| generation.ep0.as_raw_fd());
+            let endpoint_failure = self
+                .usb
+                .as_ref()
+                .map_or(-1, |generation| generation.endpoint_failure.as_raw_fd());
+            let mut pollfds = [
+                libc::pollfd {
+                    fd: signal_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: control,
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: ep0,
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: endpoint_failure,
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                },
+            ];
+            let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if pollfds[0].revents != 0 {
+                drain_signal_notifications(signal_fd)?;
+                if STOP_REQUESTED.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if RESTART_REQUESTED.swap(false, Ordering::Relaxed) {
+                    self.reload_profile()?;
+                    continue;
+                }
+            }
+            if pollfds[1].revents != 0 {
+                match protocol::receive_nonblocking(self.control.as_ref().unwrap()) {
+                    Ok(record) if record.kind == Kind::Configure => {
+                        self.configure(record, false)?;
+                        continue;
                     }
+                    Ok(record) => {
+                        return invalid(format!(
+                            "unexpected asynchronous worker message {:?}",
+                            record.kind
+                        ))
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(error) => {
                         eprintln!(
-                            "usb-gadget-supervisor: rejected SIGHUP profile reload; current incarnation remains active: {error}"
+                            "usb-gadget-supervisor: worker channel ended ({error}); restarting"
                         );
+                        self.restart_worker()?;
                         continue;
                     }
                 }
             }
-            if restart_reason.is_none() {
-                if let Some(status) = self.worker.as_mut().expect("worker exists").try_wait()? {
-                    restart_reason = Some(format!("worker exited with {status}"));
-                }
+            if pollfds[2].revents != 0 {
+                self.service_ep0()?;
             }
-            if restart_reason.is_none() {
-                match self.wait_for_control_activity(signal_fd) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        restart_reason = Some(format!("wait for worker lifecycle: {error}"));
-                    }
-                }
-            }
-            if STOP_REQUESTED.load(Ordering::Relaxed) {
-                continue;
-            }
-            if restart_reason.is_none() {
-                if let Some(status) = self.worker.as_mut().expect("worker exists").try_wait()? {
-                    restart_reason = Some(format!("worker exited with {status}"));
-                } else {
-                    match self.receive() {
-                        Ok((message, count)) => {
-                            restart_reason = Some(format!(
-                                "unexpected runtime control message {message:?} with {count} descriptors"
-                            ));
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => {
-                            restart_reason = Some(format!("control channel ended: {error}"));
-                        }
-                    }
-                }
-            }
-            if let Some(reason) = restart_reason {
-                eprintln!(
-                    "usb-gadget-supervisor: incarnation {} ended ({reason}); rebuilding",
-                    self.incarnation
-                );
-                self.cleanup_incarnation()?;
-                if STOP_REQUESTED.load(Ordering::Relaxed) {
-                    break;
-                }
-                if let Some((profile, identity)) = replacement {
-                    self.gadget = Path::new(GADGET_ROOT).join(&profile.name);
-                    self.profile = profile;
-                    self.identity = identity;
-                    println!(
-                        "usb-gadget-supervisor: accepted reloaded profile {}",
-                        self.profile.name
-                    );
-                }
-                thread::sleep(Duration::from_millis(250));
-                self.start_incarnation()?;
+            if pollfds[3].revents != 0 {
+                drain_eventfd(endpoint_failure)?;
+                eprintln!("usb-gadget-supervisor: endpoint pump failed; restarting worker");
+                self.restart_worker()?;
             }
         }
         Ok(())
@@ -180,8 +213,13 @@ impl Runtime {
         if self.cleaned {
             return Ok(());
         }
-
-        let mut first_error = self.cleanup_incarnation().err();
+        let mut first_error = self.stop_usb_generation(true).err();
+        self.control = None;
+        record_error(&mut first_error, stop_worker(&mut self.worker));
+        record_error(
+            &mut first_error,
+            remove_dir_if_exists(&self.profile.worker.runtime_directory),
+        );
         if self.configfs_mounted_by_us {
             record_error(
                 &mut first_error,
@@ -189,204 +227,11 @@ impl Runtime {
             );
             self.configfs_mounted_by_us = false;
         }
-
         self.cleaned = true;
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        first_error.map_or(Ok(()), Err)
     }
 
-    fn start_incarnation(&mut self) -> io::Result<()> {
-        self.incarnation += 1;
-        println!(
-            "usb-gadget-supervisor: starting worker incarnation {} for profile {}",
-            self.incarnation, self.profile.name
-        );
-        fs::create_dir(&self.gadget)?;
-        self.owns_gadget = true;
-        self.populate_gadget()?;
-        self.prepare_worker_directories()?;
-        self.mount_functionfs()?;
-        let mut prebind = self.publish_and_open_functionfs()?;
-        prebind.extend(self.open_resources()?);
-        self.spawn_worker(&prebind)?;
-        drop(prebind);
-        self.link_functions()?;
-        let udc = self.udc.clone().expect("UDC selected during setup");
-        write_attribute(&self.gadget.join("UDC"), &udc)?;
-        let postbind = self.open_hid_devices()?;
-        self.send_files(Message::PostbindResources, &postbind)?;
-        drop(postbind);
-        self.expect(Message::Serving)?;
-        self.control
-            .as_ref()
-            .expect("control channel exists")
-            .set_read_timeout(None)?;
-        println!(
-            "USB gadget profile {} attached through UDC {} as {:04x}:{:04x}; incarnation {} is serving as user {}",
-            self.profile.name,
-            udc,
-            self.profile.usb.vendor_id,
-            self.profile.usb.product_id,
-            self.incarnation,
-            self.identity.name,
-        );
-        Ok(())
-    }
-
-    fn cleanup_incarnation(&mut self) -> io::Result<()> {
-        let mut first_error = None;
-        if self.owns_gadget {
-            record_error(&mut first_error, self.unbind());
-        }
-        self.control = None;
-        record_error(&mut first_error, stop_worker(&mut self.worker));
-        for mount in self.mounted_functionfs.iter().rev() {
-            record_error(
-                &mut first_error,
-                unmount_filesystem(mount, "functionfs").map(|_| ()),
-            );
-        }
-        self.mounted_functionfs.clear();
-        if self.owns_gadget {
-            record_error(&mut first_error, self.remove_gadget_tree());
-            self.owns_gadget = false;
-        }
-        for function in &self.profile.functions {
-            if let FunctionProfile::Functionfs(ffs) = function {
-                record_error(&mut first_error, remove_dir_if_exists(&ffs.mount));
-            }
-        }
-        record_error(
-            &mut first_error,
-            remove_dir_if_exists(&self.profile.worker.runtime_directory),
-        );
-        if self.incarnation != 0 {
-            println!(
-                "usb-gadget-supervisor: worker incarnation {} cleaned up",
-                self.incarnation
-            );
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    fn cleanup_stale_state(&mut self) -> io::Result<()> {
-        if self.gadget.exists() {
-            self.unbind()?;
-        }
-        for function in &self.profile.functions {
-            if let FunctionProfile::Functionfs(ffs) = function {
-                unmount_filesystem(&ffs.mount, "functionfs")?;
-            }
-        }
-        if self.gadget.exists() {
-            self.remove_gadget_tree()?;
-        }
-        for function in &self.profile.functions {
-            if let FunctionProfile::Functionfs(ffs) = function {
-                remove_dir_if_exists(&ffs.mount)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn populate_gadget(&self) -> io::Result<()> {
-        let usb = &self.profile.usb;
-        write_attribute(&self.gadget.join("max_speed"), &usb.max_speed)?;
-        write_attribute(
-            &self.gadget.join("idVendor"),
-            &format!("0x{:04x}", usb.vendor_id),
-        )?;
-        write_attribute(
-            &self.gadget.join("idProduct"),
-            &format!("0x{:04x}", usb.product_id),
-        )?;
-        write_attribute(
-            &self.gadget.join("bcdUSB"),
-            &format!("0x{:04x}", usb.bcd_usb),
-        )?;
-        write_attribute(
-            &self.gadget.join("bcdDevice"),
-            &format!("0x{:04x}", usb.bcd_device),
-        )?;
-        write_attribute(
-            &self.gadget.join("bDeviceClass"),
-            &format!("0x{:02x}", usb.device_class),
-        )?;
-        write_attribute(
-            &self.gadget.join("bDeviceSubClass"),
-            &format!("0x{:02x}", usb.device_subclass),
-        )?;
-        write_attribute(
-            &self.gadget.join("bDeviceProtocol"),
-            &format!("0x{:02x}", usb.device_protocol),
-        )?;
-
-        let strings = self.gadget.join("strings/0x409");
-        fs::create_dir(&strings)?;
-        write_attribute(&strings.join("manufacturer"), &usb.manufacturer)?;
-        write_attribute(&strings.join("product"), &usb.product)?;
-        if let Some(serial) = &usb.serial {
-            write_attribute(&strings.join("serialnumber"), serial)?;
-        }
-
-        let config = self.gadget.join("configs/c.1");
-        fs::create_dir(&config)?;
-        write_attribute(&config.join("MaxPower"), &usb.max_power_ma.to_string())?;
-
-        if let Some(microsoft) = &usb.microsoft_os_1 {
-            let os_desc = self.gadget.join("os_desc");
-            write_attribute(
-                &os_desc.join("b_vendor_code"),
-                &format!("0x{:02x}", microsoft.vendor_code),
-            )?;
-            write_attribute(&os_desc.join("qw_sign"), &microsoft.signature)?;
-            write_attribute(&os_desc.join("use"), "1")?;
-            std::os::unix::fs::symlink(&config, os_desc.join("c.1"))?;
-        }
-
-        if let Some(webusb) = &usb.webusb {
-            let directory = self.gadget.join("webusb");
-            write_attribute(
-                &directory.join("bcdVersion"),
-                &format!("0x{:04x}", webusb.version),
-            )?;
-            write_attribute(
-                &directory.join("bVendorCode"),
-                &format!("0x{:02x}", webusb.vendor_code),
-            )?;
-            if !webusb.landing_page.is_empty() {
-                write_attribute(&directory.join("landingPage"), &webusb.landing_page)?;
-            }
-            write_attribute(&directory.join("use"), "1")?;
-        }
-
-        for function in &self.profile.functions {
-            match function {
-                FunctionProfile::Hid(hid) => {
-                    let directory = self.gadget.join(format!("functions/hid.{}", hid.name));
-                    fs::create_dir(&directory)?;
-                    write_attribute(&directory.join("protocol"), &hid.protocol.to_string())?;
-                    write_attribute(&directory.join("subclass"), &hid.subclass.to_string())?;
-                    write_attribute(
-                        &directory.join("report_length"),
-                        &hid.report_length.to_string(),
-                    )?;
-                    fs::write(directory.join("report_desc"), hid_report_descriptor(hid)?)?;
-                }
-                FunctionProfile::Functionfs(ffs) => {
-                    fs::create_dir(self.gadget.join(format!("functions/ffs.{}", ffs.name)))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn prepare_worker_directories(&self) -> io::Result<()> {
+    fn start_worker(&mut self) -> io::Result<()> {
         prepare_owned_directory(
             &self.profile.worker.state_directory,
             self.identity.uid,
@@ -396,86 +241,16 @@ impl Runtime {
             &self.profile.worker.runtime_directory,
             self.identity.uid,
             self.identity.gid,
-        )
-    }
-
-    fn mount_functionfs(&mut self) -> io::Result<()> {
-        for function in &self.profile.functions {
-            if let FunctionProfile::Functionfs(ffs) = function {
-                fs::create_dir_all(&ffs.mount)?;
-                let options = "uid=0,gid=0,rmode=0500,fmode=0600";
-                mount_filesystem(&ffs.name, &ffs.mount, "functionfs", Some(options))?;
-                self.mounted_functionfs.push(ffs.mount.clone());
-            }
-        }
-        Ok(())
-    }
-
-    fn publish_and_open_functionfs(&self) -> io::Result<Vec<File>> {
-        let mut files = Vec::new();
-        for function in &self.profile.functions {
-            let FunctionProfile::Functionfs(ffs) = function else {
-                continue;
-            };
-            let descriptors = decode_hex_blob(
-                &ffs.descriptors_hex,
-                &format!("FunctionFS {} descriptors", ffs.name),
-            )?;
-            let strings = decode_hex_blob(
-                &ffs.strings_hex,
-                &format!("FunctionFS {} strings", ffs.name),
-            )?;
-            let inspection = functionfs::inspect(&descriptors, &strings)?;
-            let mut ep0 = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(ffs.mount.join("ep0"))?;
-            ep0.write_all(&descriptors)?;
-            ep0.write_all(&strings)?;
-            files.push(ep0);
-            for (index, endpoint) in inspection.endpoints.iter().enumerate() {
-                let path = ffs.mount.join(format!("ep{}", index + 1));
-                let metadata = fs::symlink_metadata(&path)?;
-                if metadata.file_type().is_symlink() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "FunctionFS endpoint {} must not be a symlink",
-                            path.display()
-                        ),
-                    ));
-                }
-                let mut options = OpenOptions::new();
-                match endpoint.direction {
-                    Direction::Out => {
-                        options.read(true);
-                    }
-                    Direction::In => {
-                        options.write(true);
-                    }
-                }
-                files.push(options.custom_flags(libc::O_NONBLOCK).open(path)?);
-            }
-            println!(
-                "usb-gadget-supervisor: published FunctionFS {} with {} data endpoints",
-                ffs.name,
-                inspection.endpoints.len()
-            );
-        }
-        Ok(files)
-    }
-
-    fn spawn_worker(&mut self, prebind: &[File]) -> io::Result<()> {
-        let (mut supervisor, worker_control) = seqpacket_pair()?;
+        )?;
+        let resources = self.open_resources()?;
+        let (supervisor, worker_channel) = seqpacket_pair()?;
         supervisor.set_read_timeout(Some(Duration::from_millis(
             self.profile.worker.readiness_timeout_ms,
         )))?;
-        let control_fd = worker_control.as_raw_fd();
+        let control_fd = worker_channel.as_raw_fd();
         let parent_pid = std::process::id() as libc::pid_t;
         let uid = self.identity.uid;
         let gid = self.identity.gid;
-
         let mut command = Command::new(&self.profile.worker.command);
         command
             .args(&self.profile.worker.arguments)
@@ -488,7 +263,6 @@ impl Runtime {
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-
         unsafe {
             command.pre_exec(move || {
                 if control_fd != CONTROL_FD && libc::dup2(control_fd, CONTROL_FD) < 0 {
@@ -515,37 +289,487 @@ impl Runtime {
                 Ok(())
             });
         }
-
         let mut child = command.spawn()?;
-        drop(worker_control);
-        if let Err(error) =
-            send_message_with_files(&mut supervisor, Message::PrebindResources, prebind)
-                .and_then(|_| expect_message(&mut supervisor, Message::Prepared))
-        {
+        drop(worker_channel);
+        let body = resource_names(&self.profile.resources)?;
+        let record = Record::new(Kind::InitialResources, 0, 0, body);
+        if let Err(error) = protocol::send(&supervisor, &record, &resources) {
             let _ = terminate_child(&mut child);
             return Err(io::Error::new(
                 error.kind(),
-                format!("device worker did not become ready: {error}"),
+                format!("worker did not initialize: {error}"),
             ));
         }
-
         self.worker = Some(child);
         self.control = Some(supervisor);
+        println!(
+            "usb-gadget-supervisor: firmware worker started as {}",
+            self.identity.name
+        );
         Ok(())
     }
 
-    fn open_resources(&self) -> io::Result<Vec<File>> {
-        let mut opened = Vec::new();
-        for resource in &self.profile.resources {
-            let handle = match resource {
-                ResourceProfile::CharacterDevice(resource) => {
-                    self.open_character_device(resource)?
-                }
-                ResourceProfile::GpioLines(resource) => self.request_gpio_lines(resource)?,
-            };
-            opened.push(handle);
+    fn configure(&mut self, declaration: Record, initial: bool) -> io::Result<()> {
+        if declaration.kind != Kind::Configure
+            || declaration.generation != self.generation
+            || declaration.request_id == 0
+            || !declaration.descriptors.is_empty()
+        {
+            return invalid("worker returned a mismatched USB configuration");
         }
-        Ok(opened)
+        let request_id = declaration.request_id;
+        let (bundle, personality) = match usb_personality::discover_bundle(&declaration.body) {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                eprintln!(
+                    "usb-gadget-supervisor: rejected USB configuration request {request_id}: {error}"
+                );
+                self.reject_configuration(request_id, &error)?;
+                return if initial { Err(error) } else { Ok(()) };
+            }
+        };
+        eprintln!("usb-gadget-supervisor: USB configuration request {request_id}: {bundle:#?}");
+        self.control
+            .as_ref()
+            .unwrap()
+            .set_read_timeout(Some(Duration::from_millis(
+                self.profile.worker.readiness_timeout_ms,
+            )))?;
+        if self.usb.is_some() {
+            protocol::send(
+                self.control.as_ref().unwrap(),
+                &Record::new(Kind::Quiesce, self.generation, request_id, Vec::new()),
+                &[] as &[File],
+            )?;
+            expect_record(
+                self.control.as_ref().unwrap(),
+                Kind::Quiesced,
+                self.generation,
+                request_id,
+            )?;
+            self.stop_usb_generation(false)?;
+        }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("USB generation overflow"))?;
+        self.populate_gadget(&personality)?;
+        self.mount_functionfs()?;
+        let (ep0, endpoints) = self.publish_functionfs(&personality)?;
+        let (proxies, endpoint_pumps, pump_controls, pump_lifecycle, endpoint_failure) =
+            proxy_endpoints(endpoints, &personality.endpoints)?;
+        self.usb = Some(UsbGeneration {
+            ep0,
+            endpoint_pumps,
+            pump_controls,
+            pump_lifecycle,
+            endpoint_failure,
+        });
+        self.link_function()?;
+        let body = endpoint_map(&personality)?;
+        let files = proxies.iter().map(AsFd::as_fd).collect::<Vec<_>>();
+        protocol::send(
+            self.control.as_ref().unwrap(),
+            &Record::new(Kind::UsbEndpoints, self.generation, request_id, body),
+            &files,
+        )?;
+        expect_record(
+            self.control.as_ref().unwrap(),
+            Kind::Serving,
+            self.generation,
+            request_id,
+        )?;
+        write_attribute(&self.gadget.join("UDC"), &self.udc)?;
+        println!(
+            "USB gadget {} attached as {:04x}:{:04x}; generation {} has {} endpoints",
+            self.profile.name,
+            personality.device.vendor_id,
+            personality.device.product_id,
+            self.generation,
+            personality.endpoints.len()
+        );
+        drop(files);
+        drop(proxies);
+        self.control.as_ref().unwrap().set_read_timeout(None)?;
+        self.persist_bundle(&declaration.body)?;
+        Ok(())
+    }
+
+    fn service_ep0(&mut self) -> io::Result<()> {
+        const EVENT_LENGTH: usize = 12;
+        let mut events = [0_u8; EVENT_LENGTH * 16];
+        let ep0 = self
+            .usb
+            .as_ref()
+            .ok_or_else(|| io::Error::other("FunctionFS EP0 is unavailable"))?
+            .ep0
+            .as_raw_fd();
+        loop {
+            let length = unsafe { libc::read(ep0, events.as_mut_ptr().cast(), events.len()) };
+            if length < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            if length == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "FunctionFS EP0 closed",
+                ));
+            }
+            let length = length as usize;
+            if length % EVENT_LENGTH != 0 {
+                return invalid("truncated FunctionFS event stream");
+            }
+            for event in events[..length].chunks_exact(EVENT_LENGTH) {
+                match event[8] {
+                    0 | 1 | 2 | 3 | 5 | 6 => self.forward_bus_event(event[8])?,
+                    4 => match self.forward_control_request(&event[..8]) {
+                        Ok(()) => {}
+                        Err(error) if control_request_cancelled(&error) => {
+                            eprintln!("usb-gadget-supervisor: USB control request was superseded");
+                        }
+                        Err(error) => return Err(error),
+                    },
+                    kind => return invalid(format!("unknown FunctionFS event {kind}")),
+                }
+            }
+        }
+    }
+
+    fn forward_bus_event(&self, event: u8) -> io::Result<()> {
+        if matches!(event, 0..=3) {
+            let generation = self.usb.as_ref().expect("USB generation exists");
+            let (state, changed) = &*generation.pump_lifecycle;
+            let mut state = state
+                .lock()
+                .map_err(|_| io::Error::other("endpoint lifecycle lock poisoned"))?;
+            state.enabled = event == 2;
+            state.epoch = state
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("endpoint lifecycle epoch overflow"))?;
+            changed.notify_all();
+        }
+        protocol::send(
+            self.control.as_ref().expect("control exists"),
+            &Record::new(Kind::UsbBusEvent, self.generation, 0, vec![event]),
+            &[] as &[File],
+        )
+    }
+
+    fn forward_control_request(&mut self, setup: &[u8]) -> io::Result<()> {
+        let direction_in = setup[0] & 0x80 != 0;
+        let transfer_length = u16::from_le_bytes([setup[6], setup[7]]) as usize;
+        let mut body = Vec::with_capacity(8 + if direction_in { 0 } else { transfer_length });
+        body.extend_from_slice(setup);
+        if !direction_in && transfer_length != 0 {
+            let offset = body.len();
+            body.resize(offset + transfer_length, 0);
+            transfer_ep0(
+                self.usb
+                    .as_ref()
+                    .expect("USB generation exists")
+                    .ep0
+                    .as_raw_fd(),
+                &mut body[offset..],
+                false,
+            )?;
+        }
+        let request_id = self.next_control_request;
+        self.next_control_request = self
+            .next_control_request
+            .checked_add(1)
+            .filter(|value| *value != 0)
+            .ok_or_else(|| io::Error::other("USB control request ID overflow"))?;
+        protocol::send(
+            self.control.as_ref().expect("control exists"),
+            &Record::new(Kind::UsbControlRequest, self.generation, request_id, body),
+            &[] as &[File],
+        )?;
+        let control = self.control.as_ref().expect("control exists");
+        control.set_read_timeout(Some(Duration::from_millis(
+            self.profile.worker.readiness_timeout_ms,
+        )))?;
+        let response = protocol::receive(control);
+        control.set_read_timeout(None)?;
+        let response = response?;
+        if response.kind != Kind::UsbControlResponse
+            || response.generation != self.generation
+            || response.request_id != request_id
+            || !response.descriptors.is_empty()
+            || response.body.is_empty()
+        {
+            return invalid("worker returned a mismatched USB control response");
+        }
+        let ep0 = self
+            .usb
+            .as_ref()
+            .expect("USB generation exists")
+            .ep0
+            .as_raw_fd();
+        match response.body[0] {
+            0 if response.body.len() == 1 => stall_ep0(ep0, direction_in),
+            1 if response.body.len() == 1 && !direction_in => transfer_ep0(ep0, &mut [], true),
+            2 if direction_in => {
+                let length = response.body.len().saturating_sub(1).min(transfer_length);
+                let mut data = response.body[1..1 + length].to_vec();
+                transfer_ep0(ep0, &mut data, true)
+            }
+            _ => invalid("invalid worker USB control response"),
+        }
+    }
+
+    fn reject_configuration(&self, request_id: u32, error: &io::Error) -> io::Result<()> {
+        protocol::send(
+            self.control.as_ref().unwrap(),
+            &Record::new(
+                Kind::ConfigurationRejected,
+                self.generation,
+                request_id,
+                error.to_string().into_bytes(),
+            ),
+            &[] as &[File],
+        )
+    }
+
+    fn persist_bundle(&self, bundle: &[u8]) -> io::Result<()> {
+        fs::create_dir_all(DEBUG_BUNDLE_ROOT)?;
+        fs::set_permissions(DEBUG_BUNDLE_ROOT, fs::Permissions::from_mode(0o700))?;
+        let path = Path::new(DEBUG_BUNDLE_ROOT).join(format!("{}.cbor", self.profile.name));
+        let temporary = Path::new(DEBUG_BUNDLE_ROOT).join(format!(
+            ".{}.{}.tmp",
+            self.profile.name,
+            std::process::id()
+        ));
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        output.write_all(bundle)?;
+        output.sync_all()?;
+        fs::rename(temporary, path)
+    }
+
+    fn stop_usb_generation(&mut self, quiesce: bool) -> io::Result<()> {
+        let mut first_error = None;
+        if quiesce && self.usb.is_some() {
+            let request = Record::new(Kind::Quiesce, self.generation, 0, Vec::new());
+            if let Some(control) = self.control.as_ref() {
+                record_error(
+                    &mut first_error,
+                    control.set_read_timeout(Some(Duration::from_millis(
+                        self.profile.worker.readiness_timeout_ms,
+                    ))),
+                );
+                record_error(
+                    &mut first_error,
+                    protocol::send(control, &request, &[] as &[File])
+                        .and_then(|_| expect_record(control, Kind::Quiesced, self.generation, 0)),
+                );
+                record_error(&mut first_error, control.set_read_timeout(None));
+            }
+        }
+        if self.owns_gadget {
+            record_error(&mut first_error, self.unbind());
+        }
+        if let Some(usb) = self.usb.take() {
+            record_error(&mut first_error, stop_usb_generation(usb));
+        }
+        if self.functionfs_mounted {
+            record_error(
+                &mut first_error,
+                unmount_filesystem(&self.profile.functionfs_mount, "functionfs").map(|_| ()),
+            );
+            self.functionfs_mounted = false;
+        }
+        if self.owns_gadget {
+            record_error(&mut first_error, self.remove_gadget_tree());
+            self.owns_gadget = false;
+        }
+        record_error(
+            &mut first_error,
+            remove_dir_if_exists(&self.profile.functionfs_mount),
+        );
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn restart_worker(&mut self) -> io::Result<()> {
+        self.stop_usb_generation(false)?;
+        self.control = None;
+        stop_worker(&mut self.worker)?;
+        self.generation = 0;
+        thread::sleep(Duration::from_millis(250));
+        self.start_worker()?;
+        let configuration = protocol::receive(self.control.as_ref().unwrap())?;
+        self.configure(configuration, true)
+    }
+
+    fn reload_profile(&mut self) -> io::Result<()> {
+        validate_root_owned_file(&self.profile_path, "profile")?;
+        let profile = Profile::load(&self.profile_path)?;
+        let identity = resolve_worker_identity(&profile.worker.run_as)?;
+        validate_worker_executable(&profile.worker.command, &identity)?;
+        self.stop_usb_generation(true)?;
+        self.control = None;
+        stop_worker(&mut self.worker)?;
+        self.profile = profile;
+        self.identity = identity;
+        self.gadget = Path::new(GADGET_ROOT).join(&self.profile.name);
+        self.generation = 0;
+        self.cleanup_stale_state()?;
+        self.start_worker()?;
+        let configuration = protocol::receive(self.control.as_ref().unwrap())?;
+        self.configure(configuration, true)
+    }
+
+    fn cleanup_stale_state(&mut self) -> io::Result<()> {
+        if self.gadget.exists() {
+            let _ = self.unbind();
+            self.owns_gadget = true;
+            self.remove_gadget_tree()?;
+            self.owns_gadget = false;
+        }
+        unmount_filesystem(&self.profile.functionfs_mount, "functionfs")?;
+        remove_dir_if_exists(&self.profile.functionfs_mount)
+    }
+
+    fn populate_gadget(&mut self, personality: &Personality) -> io::Result<()> {
+        fs::create_dir(&self.gadget)?;
+        self.owns_gadget = true;
+        let usb = &personality.device;
+        write_attribute(&self.gadget.join("max_speed"), personality.max_speed)?;
+        for (name, value) in [
+            ("idVendor", format!("0x{:04x}", usb.vendor_id)),
+            ("idProduct", format!("0x{:04x}", usb.product_id)),
+            ("bcdUSB", format!("0x{:04x}", usb.bcd_usb)),
+            ("bcdDevice", format!("0x{:04x}", usb.bcd_device)),
+            ("bDeviceClass", format!("0x{:02x}", usb.device_class)),
+            ("bDeviceSubClass", format!("0x{:02x}", usb.device_subclass)),
+            ("bDeviceProtocol", format!("0x{:02x}", usb.device_protocol)),
+        ] {
+            write_attribute(&self.gadget.join(name), &value)?;
+        }
+        let strings = self.gadget.join("strings/0x409");
+        fs::create_dir(&strings)?;
+        if let Some(value) = &usb.manufacturer {
+            write_attribute(&strings.join("manufacturer"), value)?;
+        }
+        if let Some(value) = &usb.product {
+            write_attribute(&strings.join("product"), value)?;
+        }
+        if let Some(value) = &usb.serial {
+            write_attribute(&strings.join("serialnumber"), value)?;
+        }
+        let config = self.gadget.join("configs/c.1");
+        fs::create_dir(&config)?;
+        write_attribute(
+            &config.join("MaxPower"),
+            &personality.max_power_ma.to_string(),
+        )?;
+        write_attribute(
+            &config.join("bmAttributes"),
+            &format!("0x{:02x}", personality.configuration_attributes),
+        )?;
+        if let Some(microsoft) = &personality.microsoft_os_1 {
+            let os = self.gadget.join("os_desc");
+            write_attribute(
+                &os.join("b_vendor_code"),
+                &format!("0x{:02x}", microsoft.vendor_code),
+            )?;
+            write_attribute(&os.join("qw_sign"), &microsoft.signature)?;
+            write_attribute(&os.join("use"), "1")?;
+            std::os::unix::fs::symlink(&config, os.join("c.1"))?;
+        }
+        if let Some(webusb) = &personality.webusb {
+            let directory = self.gadget.join("webusb");
+            write_attribute(
+                &directory.join("bcdVersion"),
+                &format!("0x{:04x}", webusb.version),
+            )?;
+            write_attribute(
+                &directory.join("bVendorCode"),
+                &format!("0x{:02x}", webusb.vendor_code),
+            )?;
+            if !webusb.landing_page.is_empty() {
+                write_attribute(&directory.join("landingPage"), &webusb.landing_page)?;
+            }
+            write_attribute(&directory.join("use"), "1")?;
+        }
+        fs::create_dir(
+            self.gadget
+                .join(format!("functions/ffs.{}", self.profile.name)),
+        )
+    }
+
+    fn mount_functionfs(&mut self) -> io::Result<()> {
+        fs::create_dir_all(&self.profile.functionfs_mount)?;
+        mount_filesystem(
+            &self.profile.name,
+            &self.profile.functionfs_mount,
+            "functionfs",
+            Some("uid=0,gid=0,rmode=0500,fmode=0600"),
+        )?;
+        self.functionfs_mounted = true;
+        Ok(())
+    }
+
+    fn publish_functionfs(&self, personality: &Personality) -> io::Result<(File, Vec<File>)> {
+        let inspection = functionfs::inspect(&personality.descriptors, &personality.strings)?;
+        if inspection.endpoints.len() != personality.endpoints.len() {
+            return invalid("projected endpoint topology changed during validation");
+        }
+        let mut ep0 = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(self.profile.functionfs_mount.join("ep0"))?;
+        ep0.write_all(&personality.descriptors)?;
+        ep0.write_all(&personality.strings)?;
+        let mut files = Vec::new();
+        for (index, endpoint) in inspection.endpoints.iter().enumerate() {
+            let path = self
+                .profile
+                .functionfs_mount
+                .join(format!("ep{}", index + 1));
+            let mut options = OpenOptions::new();
+            match endpoint.direction {
+                Direction::Out => {
+                    options.read(true);
+                }
+                Direction::In => {
+                    options.write(true);
+                }
+            }
+            files.push(options.open(path)?);
+        }
+        Ok((ep0, files))
+    }
+
+    fn link_function(&self) -> io::Result<()> {
+        let name = format!("ffs.{}", self.profile.name);
+        std::os::unix::fs::symlink(
+            self.gadget.join("functions").join(&name),
+            self.gadget.join("configs/c.1").join(name),
+        )
+    }
+
+    fn open_resources(&self) -> io::Result<Vec<File>> {
+        self.profile
+            .resources
+            .iter()
+            .map(|resource| match resource {
+                ResourceProfile::CharacterDevice(resource) => self.open_character_device(resource),
+                ResourceProfile::GpioLines(resource) => self.request_gpio_lines(resource),
+            })
+            .collect()
     }
 
     fn open_character_device(&self, resource: &CharacterDeviceResource) -> io::Result<File> {
@@ -562,160 +786,18 @@ impl Runtime {
                 options.read(true).write(true);
             }
         }
-        let file = options.open(&resource.path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "open resource {} at {}: {error}",
-                    resource.name,
-                    resource.path.display()
-                ),
-            )
-        })?;
-        println!(
-            "usb-gadget-supervisor: opened required character-device resource {} at {}",
-            resource.name,
-            resource.path.display()
-        );
-        Ok(file)
+        options.open(&resource.path)
     }
 
     fn request_gpio_lines(&self, resource: &GpioLinesResource) -> io::Result<File> {
-        use gpiocdev_uapi::v2;
-
         validate_character_device(&resource.name, &resource.path)?;
         let chip = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&resource.path)
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "open GPIO chip for resource {} at {}: {error}",
-                        resource.name,
-                        resource.path.display()
-                    ),
-                )
-            })?;
-
-        let lines = v2::get_line(&chip, gpio_line_request(resource)).map_err(|error| {
-            io::Error::other(format!(
-                "request GPIO resource {} at {} offsets {:?}: {error}",
-                resource.name,
-                resource.path.display(),
-                resource.offsets
-            ))
-        })?;
-        println!(
-            "usb-gadget-supervisor: claimed required GPIO resource {} at {} offsets {:?}",
-            resource.name,
-            resource.path.display(),
-            resource.offsets
-        );
-        Ok(lines)
-    }
-
-    fn link_functions(&self) -> io::Result<()> {
-        for function in &self.profile.functions {
-            let directory = match function {
-                FunctionProfile::Hid(hid) => format!("hid.{}", hid.name),
-                FunctionProfile::Functionfs(ffs) => format!("ffs.{}", ffs.name),
-            };
-            std::os::unix::fs::symlink(
-                self.gadget.join("functions").join(&directory),
-                self.gadget.join("configs/c.1").join(directory),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn open_hid_devices(&self) -> io::Result<Vec<File>> {
-        let mut opened = Vec::new();
-        for function in &self.profile.functions {
-            if let FunctionProfile::Hid(hid) = function {
-                wait_for_device(&hid.device, Duration::from_secs(5))?;
-                opened.push(
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&hid.device)?,
-                );
-            }
-        }
-        Ok(opened)
-    }
-
-    fn send_files(&mut self, message: Message, files: &[File]) -> io::Result<()> {
-        send_message_with_files(
-            self.control.as_mut().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "worker channel closed")
-            })?,
-            message,
-            files,
-        )
-    }
-
-    fn expect(&mut self, expected: Message) -> io::Result<()> {
-        expect_message(
-            self.control.as_mut().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "worker channel closed")
-            })?,
-            expected,
-        )
-    }
-
-    fn receive(&mut self) -> io::Result<(Message, u16)> {
-        receive_message(
-            self.control.as_mut().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "worker channel closed")
-            })?,
-        )
-    }
-
-    fn wait_for_control_activity(&self, signal_fd: i32) -> io::Result<()> {
-        let mut descriptors = [
-            libc::pollfd {
-                fd: self
-                    .control
-                    .as_ref()
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "worker channel closed")
-                    })?
-                    .as_raw_fd(),
-                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: signal_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
-        if ready < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if descriptors[1].revents != 0 {
-            drain_signal_notifications(signal_fd)?;
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
-        }
-        Ok(())
-    }
-
-    fn load_replacement_profile(&self) -> io::Result<(Profile, WorkerIdentity)> {
-        validate_root_owned_file(&self.profile_path, "profile")?;
-        let profile = Profile::load(&self.profile_path)?;
-        let identity = resolve_worker_identity(&profile.worker.run_as)?;
-        validate_worker_executable(&profile.worker.command, &identity)?;
-        for function in &profile.functions {
-            if let FunctionProfile::Hid(hid) = function {
-                if let Some(path) = &hid.report_descriptor {
-                    validate_root_owned_file(path, "HID report descriptor")?;
-                }
-            }
-        }
-        Ok((profile, identity))
+            .open(&resource.path)?;
+        gpiocdev_uapi::v2::get_line(&chip, gpio_line_request(resource)).map_err(|error| {
+            io::Error::other(format!("request GPIO resource {}: {error}", resource.name))
+        })
     }
 
     fn unbind(&self) -> io::Result<()> {
@@ -726,23 +808,15 @@ impl Runtime {
         match fs::write(&path, "\n") {
             Ok(()) => Ok(()),
             Err(error) if error.raw_os_error() == Some(libc::ENODEV) => Ok(()),
-            Err(error) => Err(io::Error::new(
-                error.kind(),
-                format!("write {}: {error}", path.display()),
-            )),
+            Err(error) => Err(error),
         }
     }
 
     fn remove_gadget_tree(&self) -> io::Result<()> {
+        let function = format!("ffs.{}", self.profile.name);
         remove_file_if_exists(&self.gadget.join("os_desc/c.1"))?;
-        for function in self.profile.functions.iter().rev() {
-            let directory = match function {
-                FunctionProfile::Hid(hid) => format!("hid.{}", hid.name),
-                FunctionProfile::Functionfs(ffs) => format!("ffs.{}", ffs.name),
-            };
-            remove_file_if_exists(&self.gadget.join("configs/c.1").join(&directory))?;
-            remove_dir_if_exists(&self.gadget.join("functions").join(directory))?;
-        }
+        remove_file_if_exists(&self.gadget.join("configs/c.1").join(&function))?;
+        remove_dir_if_exists(&self.gadget.join("functions").join(function))?;
         remove_dir_if_exists(&self.gadget.join("configs/c.1/strings/0x409"))?;
         remove_dir_if_exists(&self.gadget.join("configs/c.1"))?;
         remove_dir_if_exists(&self.gadget.join("strings/0x409"))?;
@@ -750,9 +824,412 @@ impl Runtime {
     }
 }
 
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("usb-gadget-supervisor: cleanup failed: {error}");
+        }
+    }
+}
+
+fn resource_names(resources: &[ResourceProfile]) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        &u16::try_from(resources.len())
+            .map_err(|_| io::Error::other("too many resources"))?
+            .to_be_bytes(),
+    );
+    for resource in resources {
+        let name = resource.name().as_bytes();
+        body.extend_from_slice(
+            &u16::try_from(name.len())
+                .map_err(|_| io::Error::other("resource name too long"))?
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(name);
+    }
+    Ok(body)
+}
+
+fn endpoint_map(personality: &Personality) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        &u16::try_from(personality.endpoints.len())
+            .map_err(|_| io::Error::other("too many USB endpoints"))?
+            .to_be_bytes(),
+    );
+    for endpoint in &personality.endpoints {
+        body.push(endpoint.address);
+        body.push(endpoint.transfer_type);
+        body.extend_from_slice(&endpoint.max_packet_size.to_be_bytes());
+    }
+    Ok(body)
+}
+
+fn proxy_endpoints(
+    endpoints: Vec<File>,
+    declarations: &[usb_personality::Endpoint],
+) -> io::Result<EndpointProxies> {
+    if endpoints.len() != declarations.len() {
+        return invalid("FunctionFS endpoint and personality counts differ");
+    }
+    let lifecycle = Arc::new((Mutex::new(PumpLifecycle::default()), Condvar::new()));
+    let endpoint_failure = eventfd()?;
+    let mut worker_endpoints = Vec::with_capacity(endpoints.len());
+    let mut pumps = Vec::with_capacity(endpoints.len());
+    let mut controls = Vec::with_capacity(endpoints.len());
+    for (endpoint, declaration) in endpoints.into_iter().zip(declarations) {
+        let (pump_socket, worker_socket) = seqpacket_pair()?;
+        worker_socket.set_nonblocking(true)?;
+        controls.push(pump_socket.try_clone()?);
+        let pump_lifecycle = Arc::clone(&lifecycle);
+        let failure = endpoint_failure.try_clone()?;
+        let address = declaration.address;
+        let max_packet_size = declaration.max_packet_size as usize;
+        let pump = thread::Builder::new()
+            .name(format!("usb-ep-{address:02x}"))
+            .spawn(move || {
+                if let Err(error) = endpoint_pump(
+                    endpoint,
+                    pump_socket,
+                    address,
+                    max_packet_size,
+                    pump_lifecycle,
+                ) {
+                    eprintln!(
+                        "usb-gadget-supervisor: endpoint 0x{address:02x} pump stopped: {error}"
+                    );
+                    let one = 1_u64.to_ne_bytes();
+                    let _ = retry_write(failure.as_raw_fd(), &one);
+                }
+            })?;
+        worker_endpoints.push(worker_socket);
+        pumps.push(pump);
+    }
+    Ok((
+        worker_endpoints,
+        pumps,
+        controls,
+        lifecycle,
+        endpoint_failure,
+    ))
+}
+
+fn endpoint_pump(
+    endpoint: File,
+    proxy: UnixStream,
+    address: u8,
+    max_packet_size: usize,
+    lifecycle: Arc<(Mutex<PumpLifecycle>, Condvar)>,
+) -> io::Result<()> {
+    let mut frame = vec![0_u8; max_packet_size + 2];
+    loop {
+        let Some(epoch) = wait_for_endpoint_enable(&lifecycle, None)? else {
+            return Ok(());
+        };
+        if address & 0x80 != 0 {
+            let received = match retry_recv_packet(proxy.as_raw_fd(), &mut frame) {
+                Ok(received) => received,
+                Err(error) if endpoint_peer_closed(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if received == 0 {
+                return Ok(());
+            }
+            if received < 2 {
+                return invalid(format!(
+                    "endpoint 0x{address:02x} received a truncated proxy packet"
+                ));
+            }
+            let length = u16::from_be_bytes([frame[0], frame[1]]) as usize;
+            if received != length + 2 || length > max_packet_size {
+                return invalid(format!(
+                    "endpoint 0x{address:02x} received an invalid proxy packet"
+                ));
+            }
+            let transferred = match retry_write(endpoint.as_raw_fd(), &frame[2..2 + length]) {
+                Ok(transferred) => transferred,
+                Err(error) if functionfs_generation_ended(&error) => {
+                    if wait_for_endpoint_enable(&lifecycle, Some(epoch))?.is_none() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if transferred != length {
+                return short_endpoint_transfer(address);
+            }
+        } else {
+            let length = match retry_read(endpoint.as_raw_fd(), &mut frame[2..]) {
+                Ok(length) => length,
+                Err(error) if functionfs_generation_ended(&error) => {
+                    if wait_for_endpoint_enable(&lifecycle, Some(epoch))?.is_none() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            frame[..2].copy_from_slice(&(length as u16).to_be_bytes());
+            let transferred = match retry_send_packet(proxy.as_raw_fd(), &frame[..2 + length]) {
+                Ok(transferred) => transferred,
+                Err(error) if endpoint_peer_closed(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if transferred != length + 2 {
+                return short_endpoint_transfer(address);
+            }
+        }
+    }
+}
+
+fn wait_for_endpoint_enable(
+    lifecycle: &Arc<(Mutex<PumpLifecycle>, Condvar)>,
+    after_epoch: Option<u64>,
+) -> io::Result<Option<u64>> {
+    let (state, changed) = &**lifecycle;
+    let mut state = state
+        .lock()
+        .map_err(|_| io::Error::other("endpoint lifecycle lock poisoned"))?;
+    loop {
+        if state.stopping {
+            return Ok(None);
+        }
+        if state.enabled && after_epoch != Some(state.epoch) {
+            return Ok(Some(state.epoch));
+        }
+        state = changed
+            .wait(state)
+            .map_err(|_| io::Error::other("endpoint lifecycle lock poisoned"))?;
+    }
+}
+
+fn functionfs_generation_ended(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENODEV) | Some(libc::ESHUTDOWN)
+    )
+}
+
+fn endpoint_peer_closed(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EPIPE) | Some(libc::ECONNRESET) | Some(libc::ESHUTDOWN)
+    )
+}
+
+fn retry_recv_packet(fd: i32, packet: &mut [u8]) -> io::Result<usize> {
+    retry_io(|| unsafe {
+        libc::recv(
+            fd,
+            packet.as_mut_ptr().cast(),
+            packet.len(),
+            libc::MSG_TRUNC,
+        )
+    })
+}
+
+fn retry_read(fd: i32, packet: &mut [u8]) -> io::Result<usize> {
+    retry_io(|| unsafe { libc::read(fd, packet.as_mut_ptr().cast(), packet.len()) })
+}
+
+fn retry_write(fd: i32, packet: &[u8]) -> io::Result<usize> {
+    retry_io(|| unsafe { libc::write(fd, packet.as_ptr().cast(), packet.len()) })
+}
+
+fn retry_send_packet(fd: i32, packet: &[u8]) -> io::Result<usize> {
+    retry_io(|| unsafe { libc::send(fd, packet.as_ptr().cast(), packet.len(), libc::MSG_NOSIGNAL) })
+}
+
+fn retry_io(mut operation: impl FnMut() -> libc::ssize_t) -> io::Result<usize> {
+    loop {
+        let result = operation();
+        if result >= 0 {
+            return Ok(result as usize);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn short_endpoint_transfer(address: u8) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::WriteZero,
+        format!("short endpoint 0x{address:02x} packet transfer"),
+    ))
+}
+
+fn stop_usb_generation(usb: UsbGeneration) -> io::Result<()> {
+    let UsbGeneration {
+        ep0,
+        endpoint_pumps,
+        pump_controls,
+        pump_lifecycle,
+        endpoint_failure: _,
+    } = usb;
+    let (state, changed) = &*pump_lifecycle;
+    if let Ok(mut state) = state.lock() {
+        state.stopping = true;
+        changed.notify_all();
+    }
+    for control in pump_controls {
+        let _ = control.shutdown(Shutdown::Both);
+    }
+    drop(ep0);
+    for pump in endpoint_pumps {
+        if pump.join().is_err() {
+            return Err(io::Error::other("FunctionFS endpoint pump panicked"));
+        }
+    }
+    Ok(())
+}
+
+fn eventfd() -> io::Result<File> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn drain_eventfd(fd: i32) -> io::Result<()> {
+    let mut value = 0_u64;
+    let length = unsafe {
+        libc::read(
+            fd,
+            (&mut value as *mut u64).cast::<c_void>(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    if length == std::mem::size_of::<u64>() as isize {
+        return Ok(());
+    }
+    if length < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+        return Ok(());
+    }
+    Err(io::Error::other("invalid endpoint failure notification"))
+}
+
+fn expect_record(
+    channel: &UnixStream,
+    kind: Kind,
+    generation: u32,
+    request_id: u32,
+) -> io::Result<()> {
+    let record = protocol::receive(channel)?;
+    if record.kind != kind
+        || record.generation != generation
+        || record.request_id != request_id
+        || !record.body.is_empty()
+        || !record.descriptors.is_empty()
+    {
+        return invalid(format!(
+            "worker returned {:?} instead of {kind:?}",
+            record.kind
+        ));
+    }
+    Ok(())
+}
+
+fn transfer_ep0(fd: i32, buffer: &mut [u8], write_transfer: bool) -> io::Result<()> {
+    let mut offset = 0;
+    loop {
+        let (pointer, length) = if buffer.is_empty() {
+            (std::ptr::null_mut(), 0)
+        } else {
+            (
+                unsafe { buffer.as_mut_ptr().add(offset) }.cast::<c_void>(),
+                buffer.len() - offset,
+            )
+        };
+        let transferred = unsafe {
+            if write_transfer {
+                libc::write(fd, pointer.cast_const(), length)
+            } else {
+                libc::read(fd, pointer, length)
+            }
+        };
+        if transferred >= 0 {
+            let transferred = transferred as usize;
+            if write_transfer {
+                return if transferred == length {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short FunctionFS EP0 write",
+                    ))
+                };
+            }
+            offset += transferred;
+            if offset == buffer.len() {
+                return Ok(());
+            }
+            if transferred == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short FunctionFS EP0 read",
+                ));
+            }
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+        let mut waiter = libc::pollfd {
+            fd,
+            events: if write_transfer {
+                libc::POLLOUT
+            } else {
+                libc::POLLIN
+            },
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut waiter, 1, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if waiter.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::from_raw_os_error(libc::ESHUTDOWN));
+        }
+    }
+}
+
+fn control_request_cancelled(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EIDRM)
+}
+
+fn stall_ep0(fd: i32, direction_in: bool) -> io::Result<()> {
+    let result = unsafe {
+        if direction_in {
+            libc::read(fd, std::ptr::null_mut(), 0)
+        } else {
+            libc::write(fd, std::ptr::null(), 0)
+        }
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EL2HLT) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    invalid("FunctionFS did not stall EP0")
+}
+
 fn gpio_line_request(resource: &GpioLinesResource) -> gpiocdev_uapi::v2::LineRequest {
     use gpiocdev_uapi::v2::{LineConfig, LineFlags, LineRequest, LineValues, Offsets};
-
     let mut flags = match resource.direction {
         GpioDirection::Input => LineFlags::INPUT,
         GpioDirection::Output => LineFlags::OUTPUT,
@@ -788,11 +1265,10 @@ fn gpio_line_request(resource: &GpioLinesResource) -> gpiocdev_uapi::v2::LineReq
     }
 }
 
-fn drain_signal_notifications(descriptor: i32) -> io::Result<()> {
+fn drain_signal_notifications(fd: i32) -> io::Result<()> {
     let mut bytes = [0_u8; 64];
     loop {
-        let length =
-            unsafe { libc::read(descriptor, bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) };
+        let length = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
         if length > 0 {
             continue;
         }
@@ -810,14 +1286,6 @@ fn drain_signal_notifications(descriptor: i32) -> io::Result<()> {
     }
 }
 
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        if let Err(error) = self.cleanup() {
-            eprintln!("usb-gadget-supervisor: cleanup failed: {error}");
-        }
-    }
-}
-
 fn validate_character_device(name: &str, path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         io::Error::new(
@@ -826,35 +1294,25 @@ fn validate_character_device(name: &str, path: &Path) -> io::Result<()> {
         )
     })?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_char_device() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "resource {name} at {} must be a non-symlink character device",
-                path.display()
-            ),
+        return invalid(format!(
+            "resource {name} at {} must be a non-symlink character device",
+            path.display()
         ));
     }
     Ok(())
 }
 
 fn validate_root_owned_file(path: &Path, label: &str) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("inspect {label} {}: {error}", path.display()),
-        )
-    })?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(io::Error::other(format!(
-            "{label} {} must be a regular non-symlink file",
-            path.display()
-        )));
-    }
-    if metadata.uid() != 0 || metadata.mode() & 0o6022 != 0 {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o6022 != 0
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{label} {} must be root-owned, non-set-ID, and not group/world writable",
+                "{label} {} must be a root-owned, non-set-ID, non-writable regular file",
                 path.display()
             ),
         ));
@@ -863,45 +1321,34 @@ fn validate_root_owned_file(path: &Path, label: &str) -> io::Result<()> {
 }
 
 fn validate_worker_executable(path: &Path, identity: &WorkerIdentity) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("inspect worker executable {}: {error}", path.display()),
-        )
-    })?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(io::Error::other(format!(
-            "worker executable {} must be a regular non-symlink file",
-            path.display()
-        )));
-    }
+    let metadata = fs::symlink_metadata(path)?;
     let mode = metadata.mode();
-    let invalid_owner = metadata.uid() != 0 && metadata.uid() != identity.uid;
-    let set_id = mode & 0o6000 != 0;
-    let world_writable = mode & 0o0002 != 0;
-    let foreign_group_writable = mode & 0o0020 != 0 && metadata.gid() != identity.gid;
-    if invalid_owner || set_id || world_writable || foreign_group_writable {
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || (metadata.uid() != 0 && metadata.uid() != identity.uid)
+        || mode & 0o6002 != 0
+        || (mode & 0o0020 != 0 && metadata.gid() != identity.gid)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "worker executable {} must be owned by root or {}, non-set-ID, not world writable, and writable by no group other than the worker's primary group",
-                path.display(), identity.name
+                "worker {} has unsafe ownership or permissions",
+                path.display()
             ),
         ));
     }
-
-    let executable_bit = if metadata.uid() == identity.uid {
+    let executable = if metadata.uid() == identity.uid {
         0o100
     } else if metadata.gid() == identity.gid {
         0o010
     } else {
         0o001
     };
-    if mode & executable_bit == 0 {
+    if mode & executable == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "worker executable {} is not executable by {}",
+                "worker {} is not executable by {}",
                 path.display(),
                 identity.name
             ),
@@ -914,10 +1361,7 @@ fn resolve_worker_identity(name: &str) -> io::Result<WorkerIdentity> {
     let uid = query_account_id("-u", name)?;
     let gid = query_account_id("-g", name)?;
     if uid == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the worker account must not be root",
-        ));
+        return invalid("worker account must not be root");
     }
     Ok(WorkerIdentity {
         name: name.to_owned(),
@@ -933,14 +1377,14 @@ fn query_account_id(flag: &str, name: &str) -> io::Result<u32> {
     if !output.status.success() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("cannot resolve worker account {name:?}"),
+            format!("cannot resolve worker account {name}"),
         ));
     }
     std::str::from_utf8(&output.stdout)
-        .map_err(|_| io::Error::other("id returned non-UTF-8 output"))?
+        .map_err(io::Error::other)?
         .trim()
         .parse()
-        .map_err(|_| io::Error::other(format!("id returned an invalid ID for {name:?}")))
+        .map_err(io::Error::other)
 }
 
 fn acquire_lock() -> io::Result<File> {
@@ -951,137 +1395,75 @@ fn acquire_lock() -> io::Result<File> {
         .truncate(false)
         .open(LOCK_FILE)?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "another USB gadget supervisor owns the UDC lifecycle lock",
-            ));
-        }
-        return Err(error);
+        return Err(io::Error::last_os_error());
     }
     Ok(lock)
 }
 
 fn ensure_configfs() -> io::Result<bool> {
     fs::create_dir_all(CONFIGFS)?;
-    let mut mounted_by_us = false;
-    if !is_mounted_as(Path::new(CONFIGFS), "configfs")? {
+    let mounted = if is_mounted_as(Path::new(CONFIGFS), "configfs")? {
+        false
+    } else {
         mount_filesystem("none", Path::new(CONFIGFS), "configfs", None)?;
-        mounted_by_us = true;
-    }
-    let result = (|| {
-        if !Path::new(GADGET_ROOT).is_dir() {
-            let status = Command::new("modprobe").arg("libcomposite").status()?;
-            if !status.success() {
-                return Err(io::Error::other(format!(
-                    "modprobe libcomposite exited with {status}"
-                )));
-            }
+        true
+    };
+    if !Path::new(GADGET_ROOT).is_dir() {
+        let status = Command::new("modprobe").arg("libcomposite").status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "modprobe libcomposite exited with {status}"
+            )));
         }
-        if !Path::new(GADGET_ROOT).is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "configfs USB gadget support is unavailable",
-            ));
-        }
-        Ok(mounted_by_us)
-    })();
-    if result.is_err() && mounted_by_us {
-        let _ = unmount_filesystem(Path::new(CONFIGFS), "configfs");
     }
-    result
+    if !Path::new(GADGET_ROOT).is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "ConfigFS USB gadget support is unavailable",
+        ));
+    }
+    Ok(mounted)
 }
 
 fn select_udc(requested: Option<&str>) -> io::Result<String> {
-    let mut available = fs::read_dir("/sys/class/udc")?
+    let mut names = fs::read_dir("/sys/class/udc")?
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect::<Vec<_>>();
-    available.sort();
-    if let Some(name) = requested {
-        if available.iter().any(|candidate| candidate == name) {
-            return Ok(name.to_owned());
+    names.sort();
+    if let Some(requested) = requested {
+        if names.iter().any(|name| name == requested) {
+            return Ok(requested.to_owned());
         }
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!(
-                "requested UDC {name:?} is unavailable; found: {}",
-                available.join(", ")
-            ),
+            format!("UDC {requested} is unavailable"),
         ));
     }
-    available.into_iter().next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "no USB device controller found; enable peripheral mode and reboot",
-        )
-    })
+    names
+        .into_iter()
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no USB device controller found"))
 }
 
 fn prepare_owned_directory(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     fs::create_dir_all(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(io::Error::other(format!(
-            "{} is not a real directory",
-            path.display()
-        )));
+        return invalid(format!("{} is not a real directory", path.display()));
     }
     chown(path, Some(uid), Some(gid))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-fn wait_for_device(path: &Path, timeout: Duration) -> io::Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match fs::symlink_metadata(path) {
-            Ok(metadata)
-                if metadata.file_type().is_char_device() && !metadata.file_type().is_symlink() =>
-            {
-                return Ok(());
-            }
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not a non-symlink character device", path.display()),
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{} did not appear after UDC binding", path.display()),
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn hid_report_descriptor(hid: &HidFunction) -> io::Result<Vec<u8>> {
-    match (&hid.report_descriptor, &hid.report_descriptor_hex) {
-        (Some(path), None) => {
-            let source = fs::read_to_string(path)?;
-            decode_hex_descriptor(&source, &path.display().to_string())
-        }
-        (None, Some(source)) => decode_hex_descriptor(source, "inline HID report descriptor"),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "HID report descriptor source was not validated",
-        )),
-    }
-}
-
 fn seqpacket_pair() -> io::Result<(UnixStream, UnixStream)> {
-    let mut descriptors = [-1; 2];
+    let mut fds = [-1; 2];
     if unsafe {
         libc::socketpair(
             libc::AF_UNIX,
             libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
             0,
-            descriptors.as_mut_ptr(),
+            fds.as_mut_ptr(),
         )
     } != 0
     {
@@ -1089,111 +1471,10 @@ fn seqpacket_pair() -> io::Result<(UnixStream, UnixStream)> {
     }
     Ok(unsafe {
         (
-            UnixStream::from_raw_fd(descriptors[0]),
-            UnixStream::from_raw_fd(descriptors[1]),
+            UnixStream::from_raw_fd(fds[0]),
+            UnixStream::from_raw_fd(fds[1]),
         )
     })
-}
-
-fn send_message_with_files<T: AsRawFd>(
-    channel: &mut UnixStream,
-    message: Message,
-    files: &[T],
-) -> io::Result<()> {
-    let descriptor_count = u16::try_from(files.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "too many descriptors for one worker-control packet",
-        )
-    })?;
-    let packet = message.encode(descriptor_count);
-    let mut iovec = libc::iovec {
-        iov_base: packet.as_ptr().cast::<c_void>().cast_mut(),
-        iov_len: packet.len(),
-    };
-    let raw_descriptors = files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
-    let control_length = if raw_descriptors.is_empty() {
-        0
-    } else {
-        unsafe {
-            libc::CMSG_SPACE(
-                (raw_descriptors.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint,
-            ) as usize
-        }
-    };
-    let mut control = vec![0_u8; control_length];
-    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
-    header.msg_iov = &mut iovec;
-    header.msg_iovlen = 1;
-    if !control.is_empty() {
-        header.msg_control = control.as_mut_ptr().cast::<c_void>();
-        header.msg_controllen = control.len();
-        unsafe {
-            let ancillary = libc::CMSG_FIRSTHDR(&header);
-            (*ancillary).cmsg_level = libc::SOL_SOCKET;
-            (*ancillary).cmsg_type = libc::SCM_RIGHTS;
-            (*ancillary).cmsg_len = libc::CMSG_LEN(
-                (raw_descriptors.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint,
-            ) as usize;
-            std::ptr::copy_nonoverlapping(
-                raw_descriptors.as_ptr(),
-                libc::CMSG_DATA(ancillary).cast::<libc::c_int>(),
-                raw_descriptors.len(),
-            );
-        }
-    }
-    let length = unsafe { libc::sendmsg(channel.as_raw_fd(), &header, libc::MSG_NOSIGNAL) };
-    if length < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if length as usize != packet.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "worker-control packet was not sent atomically",
-        ));
-    }
-    Ok(())
-}
-
-fn receive_message(channel: &mut UnixStream) -> io::Result<(Message, u16)> {
-    let mut record = [0_u8; PACKET_LENGTH + 1];
-    let length = unsafe {
-        libc::recv(
-            channel.as_raw_fd(),
-            record.as_mut_ptr().cast::<c_void>(),
-            record.len(),
-            0,
-        )
-    };
-    if length < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if length == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "worker-control channel closed",
-        ));
-    }
-    if length as usize != PACKET_LENGTH {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("worker-control record has invalid length {length}"),
-        ));
-    }
-    Message::decode(record[..PACKET_LENGTH].try_into().unwrap())
-}
-
-fn expect_message(channel: &mut UnixStream, expected: Message) -> io::Result<()> {
-    let (message, descriptor_count) = receive_message(channel)?;
-    if message != expected || descriptor_count != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "worker sent {message:?} with {descriptor_count} descriptors instead of {expected:?}"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn stop_worker(worker: &mut Option<Child>) -> io::Result<()> {
@@ -1211,9 +1492,7 @@ fn stop_worker(worker: &mut Option<Child>) -> io::Result<()> {
 }
 
 fn terminate_child(child: &mut Child) -> io::Result<()> {
-    if child.try_wait()?.is_none()
-        && unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } != 0
-    {
+    if child.try_wait()?.is_none() && unsafe { libc::kill(child.id() as _, libc::SIGTERM) } != 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
             return Err(error);
@@ -1259,8 +1538,8 @@ fn unmount_filesystem(target: &Path, filesystem: &str) -> io::Result<bool> {
     if !is_mounted_as(target, filesystem)? {
         return Ok(false);
     }
-    let target_c = CString::new(target.as_os_str().as_bytes())?;
-    if unsafe { libc::umount2(target_c.as_ptr(), 0) } != 0 {
+    let target = CString::new(target.as_os_str().as_bytes())?;
+    if unsafe { libc::umount2(target.as_ptr(), 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(true)
@@ -1271,7 +1550,7 @@ fn is_mounted_as(target: &Path, filesystem: &str) -> io::Result<bool> {
     let target = target.to_string_lossy();
     Ok(mounts.lines().any(|line| {
         let mut fields = line.split_whitespace();
-        let _source = fields.next();
+        let _ = fields.next();
         fields.next() == Some(target.as_ref()) && fields.next() == Some(filesystem)
     }))
 }
@@ -1283,7 +1562,6 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
-
 fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
     match fs::remove_dir(path) {
         Ok(()) => Ok(()),
@@ -1291,44 +1569,13 @@ fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
-
-fn record_error(first_error: &mut Option<io::Error>, result: io::Result<()>) {
+fn record_error(first: &mut Option<io::Error>, result: io::Result<()>) {
     if let Err(error) = result {
-        if first_error.is_none() {
-            *first_error = Some(error);
+        if first.is_none() {
+            *first = Some(error);
         }
     }
 }
-
-#[cfg(test)]
-mod gpio_tests {
-    use super::gpio_line_request;
-    use crate::profile::{GpioDirection, GpioLinesResource};
-    use gpiocdev_uapi::v2::LineAttributeValue;
-    use std::path::PathBuf;
-
-    #[test]
-    fn request_preserves_profile_order_and_value_bits() {
-        let resource = GpioLinesResource {
-            name: "display-control".into(),
-            path: PathBuf::from("/dev/gpiochip0"),
-            offsets: vec![25, 27, 24],
-            direction: GpioDirection::Output,
-            active_low: false,
-            bias: None,
-            edge: None,
-            initial_values: Some(vec![false, true, false]),
-        };
-
-        let request = gpio_line_request(&resource);
-        assert_eq!(request.num_lines, 3);
-        assert_eq!(request.offsets.get(0), 25);
-        assert_eq!(request.offsets.get(1), 27);
-        assert_eq!(request.offsets.get(2), 24);
-        assert_eq!(request.config.attr(0).mask, 0b111);
-        assert_eq!(
-            request.config.attr(0).attr.to_value(),
-            Some(LineAttributeValue::Values(0b010))
-        );
-    }
+fn invalid<T>(message: impl Into<String>) -> io::Result<T> {
+    Err(io::Error::new(io::ErrorKind::InvalidData, message.into()))
 }
