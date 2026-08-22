@@ -329,7 +329,7 @@ impl Runtime {
                 return if initial { Err(error) } else { Ok(()) };
             }
         };
-        eprintln!("usb-gadget-supervisor: USB configuration request {request_id}: {bundle:#?}");
+        eprintln!("usb-gadget-supervisor: USB configuration request {request_id}: {bundle:?}");
         self.control
             .as_ref()
             .unwrap()
