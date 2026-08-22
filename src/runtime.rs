@@ -11,7 +11,6 @@ use crate::{RESTART_REQUESTED, STOP_REQUESTED};
 use std::ffi::{c_void, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{chown, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -20,9 +19,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
+use usb_gadget_worker::UsbBusEvent;
 
 const CONFIGFS: &str = "/sys/kernel/config";
 const GADGET_ROOT: &str = "/sys/kernel/config/usb_gadget";
@@ -37,26 +36,10 @@ struct WorkerIdentity {
 
 struct UsbGeneration {
     ep0: File,
-    endpoint_pumps: Vec<JoinHandle<()>>,
-    pump_controls: Vec<UnixStream>,
-    pump_lifecycle: Arc<(Mutex<PumpLifecycle>, Condvar)>,
-    endpoint_failure: File,
+    endpoints: Vec<File>,
+    endpoints_enabled: bool,
+    endpoint_activation: u64,
 }
-
-#[derive(Default)]
-struct PumpLifecycle {
-    enabled: bool,
-    stopping: bool,
-    epoch: u64,
-}
-
-type EndpointProxies = (
-    Vec<UnixStream>,
-    Vec<JoinHandle<()>>,
-    Vec<UnixStream>,
-    Arc<(Mutex<PumpLifecycle>, Condvar)>,
-    File,
-);
 
 pub(crate) struct Runtime {
     profile_path: PathBuf,
@@ -131,10 +114,6 @@ impl Runtime {
                 .usb
                 .as_ref()
                 .map_or(-1, |generation| generation.ep0.as_raw_fd());
-            let endpoint_failure = self
-                .usb
-                .as_ref()
-                .map_or(-1, |generation| generation.endpoint_failure.as_raw_fd());
             let mut pollfds = [
                 libc::pollfd {
                     fd: signal_fd,
@@ -148,11 +127,6 @@ impl Runtime {
                 },
                 libc::pollfd {
                     fd: ep0,
-                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: endpoint_failure,
                     events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
                     revents: 0,
                 },
@@ -200,11 +174,6 @@ impl Runtime {
             if pollfds[2].revents != 0 {
                 self.service_ep0()?;
             }
-            if pollfds[3].revents != 0 {
-                drain_eventfd(endpoint_failure)?;
-                eprintln!("usb-gadget-supervisor: endpoint pump failed; restarting worker");
-                self.restart_worker()?;
-            }
         }
         Ok(())
     }
@@ -213,9 +182,16 @@ impl Runtime {
         if self.cleaned {
             return Ok(());
         }
-        let mut first_error = self.stop_usb_generation(true).err();
+        let mut first_error = None;
+        if self.owns_gadget {
+            record_error(&mut first_error, self.unbind());
+        }
+        if self.usb.is_some() {
+            record_error(&mut first_error, self.quiesce_worker(0));
+        }
         self.control = None;
         record_error(&mut first_error, stop_worker(&mut self.worker));
+        record_error(&mut first_error, self.stop_usb_generation());
         record_error(
             &mut first_error,
             remove_dir_if_exists(&self.profile.worker.runtime_directory),
@@ -337,18 +313,9 @@ impl Runtime {
                 self.profile.worker.readiness_timeout_ms,
             )))?;
         if self.usb.is_some() {
-            protocol::send(
-                self.control.as_ref().unwrap(),
-                &Record::new(Kind::Quiesce, self.generation, request_id, Vec::new()),
-                &[] as &[File],
-            )?;
-            expect_record(
-                self.control.as_ref().unwrap(),
-                Kind::Quiesced,
-                self.generation,
-                request_id,
-            )?;
-            self.stop_usb_generation(false)?;
+            self.unbind()?;
+            self.quiesce_worker(request_id)?;
+            self.stop_usb_generation()?;
         }
         self.generation = self
             .generation
@@ -357,18 +324,22 @@ impl Runtime {
         self.populate_gadget(&personality)?;
         self.mount_functionfs()?;
         let (ep0, endpoints) = self.publish_functionfs(&personality)?;
-        let (proxies, endpoint_pumps, pump_controls, pump_lifecycle, endpoint_failure) =
-            proxy_endpoints(endpoints, &personality.endpoints)?;
         self.usb = Some(UsbGeneration {
             ep0,
-            endpoint_pumps,
-            pump_controls,
-            pump_lifecycle,
-            endpoint_failure,
+            endpoints,
+            endpoints_enabled: false,
+            endpoint_activation: 0,
         });
         self.link_function()?;
         let body = endpoint_map(&personality)?;
-        let files = proxies.iter().map(AsFd::as_fd).collect::<Vec<_>>();
+        let files = self
+            .usb
+            .as_ref()
+            .expect("USB generation exists")
+            .endpoints
+            .iter()
+            .map(AsFd::as_fd)
+            .collect::<Vec<_>>();
         protocol::send(
             self.control.as_ref().unwrap(),
             &Record::new(Kind::UsbEndpoints, self.generation, request_id, body),
@@ -390,7 +361,6 @@ impl Runtime {
             personality.endpoints.len()
         );
         drop(files);
-        drop(proxies);
         self.control.as_ref().unwrap().set_read_timeout(None)?;
         self.persist_bundle(&declaration.body)?;
         Ok(())
@@ -443,23 +413,33 @@ impl Runtime {
         }
     }
 
-    fn forward_bus_event(&self, event: u8) -> io::Result<()> {
-        if matches!(event, 0..=3) {
-            let generation = self.usb.as_ref().expect("USB generation exists");
-            let (state, changed) = &*generation.pump_lifecycle;
-            let mut state = state
-                .lock()
-                .map_err(|_| io::Error::other("endpoint lifecycle lock poisoned"))?;
-            state.enabled = event == 2;
-            state.epoch = state
-                .epoch
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("endpoint lifecycle epoch overflow"))?;
-            changed.notify_all();
-        }
+    fn forward_bus_event(&mut self, event: u8) -> io::Result<()> {
+        let event = UsbBusEvent::from_byte(event)?;
+        let activation = {
+            let generation = self.usb.as_mut().expect("USB generation exists");
+            if event == UsbBusEvent::Enable && !generation.endpoints_enabled {
+                generation.endpoint_activation = generation
+                    .endpoint_activation
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("endpoint activation overflow"))?;
+                generation.endpoints_enabled = true;
+            }
+            if matches!(
+                event,
+                UsbBusEvent::Bind | UsbBusEvent::Unbind | UsbBusEvent::Disable
+            ) {
+                generation.endpoints_enabled = false;
+            }
+            generation.endpoint_activation
+        };
         protocol::send(
             self.control.as_ref().expect("control exists"),
-            &Record::new(Kind::UsbBusEvent, self.generation, 0, vec![event]),
+            &Record::new(
+                Kind::UsbBusEvent,
+                self.generation,
+                0,
+                event.encode(activation).to_vec(),
+            ),
             &[] as &[File],
         )
     }
@@ -559,31 +539,29 @@ impl Runtime {
         fs::rename(temporary, path)
     }
 
-    fn stop_usb_generation(&mut self, quiesce: bool) -> io::Result<()> {
+    fn quiesce_worker(&self, request_id: u32) -> io::Result<()> {
+        let Some(control) = self.control.as_ref() else {
+            return Ok(());
+        };
+        control.set_read_timeout(Some(Duration::from_millis(
+            self.profile.worker.readiness_timeout_ms,
+        )))?;
+        let result = protocol::send(
+            control,
+            &Record::new(Kind::Quiesce, self.generation, request_id, Vec::new()),
+            &[] as &[File],
+        )
+        .and_then(|_| expect_record(control, Kind::Quiesced, self.generation, request_id));
+        let timeout_result = control.set_read_timeout(None);
+        result.and(timeout_result)
+    }
+
+    fn stop_usb_generation(&mut self) -> io::Result<()> {
         let mut first_error = None;
-        if quiesce && self.usb.is_some() {
-            let request = Record::new(Kind::Quiesce, self.generation, 0, Vec::new());
-            if let Some(control) = self.control.as_ref() {
-                record_error(
-                    &mut first_error,
-                    control.set_read_timeout(Some(Duration::from_millis(
-                        self.profile.worker.readiness_timeout_ms,
-                    ))),
-                );
-                record_error(
-                    &mut first_error,
-                    protocol::send(control, &request, &[] as &[File])
-                        .and_then(|_| expect_record(control, Kind::Quiesced, self.generation, 0)),
-                );
-                record_error(&mut first_error, control.set_read_timeout(None));
-            }
-        }
         if self.owns_gadget {
             record_error(&mut first_error, self.unbind());
         }
-        if let Some(usb) = self.usb.take() {
-            record_error(&mut first_error, stop_usb_generation(usb));
-        }
+        self.usb = None;
         if self.functionfs_mounted {
             record_error(
                 &mut first_error,
@@ -603,9 +581,12 @@ impl Runtime {
     }
 
     fn restart_worker(&mut self) -> io::Result<()> {
-        self.stop_usb_generation(false)?;
+        if self.owns_gadget {
+            self.unbind()?;
+        }
         self.control = None;
         stop_worker(&mut self.worker)?;
+        self.stop_usb_generation()?;
         self.generation = 0;
         thread::sleep(Duration::from_millis(250));
         self.start_worker()?;
@@ -618,9 +599,15 @@ impl Runtime {
         let profile = Profile::load(&self.profile_path)?;
         let identity = resolve_worker_identity(&profile.worker.run_as)?;
         validate_worker_executable(&profile.worker.command, &identity)?;
-        self.stop_usb_generation(true)?;
+        if self.owns_gadget {
+            self.unbind()?;
+        }
+        if self.usb.is_some() {
+            self.quiesce_worker(0)?;
+        }
         self.control = None;
         stop_worker(&mut self.worker)?;
+        self.stop_usb_generation()?;
         self.profile = profile;
         self.identity = identity;
         self.gadget = Path::new(GADGET_ROOT).join(&self.profile.name);
@@ -865,253 +852,6 @@ fn endpoint_map(personality: &Personality) -> io::Result<Vec<u8>> {
         body.extend_from_slice(&endpoint.max_packet_size.to_be_bytes());
     }
     Ok(body)
-}
-
-fn proxy_endpoints(
-    endpoints: Vec<File>,
-    declarations: &[usb_personality::Endpoint],
-) -> io::Result<EndpointProxies> {
-    if endpoints.len() != declarations.len() {
-        return invalid("FunctionFS endpoint and personality counts differ");
-    }
-    let lifecycle = Arc::new((Mutex::new(PumpLifecycle::default()), Condvar::new()));
-    let endpoint_failure = eventfd()?;
-    let mut worker_endpoints = Vec::with_capacity(endpoints.len());
-    let mut pumps = Vec::with_capacity(endpoints.len());
-    let mut controls = Vec::with_capacity(endpoints.len());
-    for (endpoint, declaration) in endpoints.into_iter().zip(declarations) {
-        let (pump_socket, worker_socket) = seqpacket_pair()?;
-        worker_socket.set_nonblocking(true)?;
-        controls.push(pump_socket.try_clone()?);
-        let pump_lifecycle = Arc::clone(&lifecycle);
-        let failure = endpoint_failure.try_clone()?;
-        let address = declaration.address;
-        let max_packet_size = declaration.max_packet_size as usize;
-        let pump = thread::Builder::new()
-            .name(format!("usb-ep-{address:02x}"))
-            .spawn(move || {
-                if let Err(error) = endpoint_pump(
-                    endpoint,
-                    pump_socket,
-                    address,
-                    max_packet_size,
-                    pump_lifecycle,
-                ) {
-                    eprintln!(
-                        "usb-gadget-supervisor: endpoint 0x{address:02x} pump stopped: {error}"
-                    );
-                    let one = 1_u64.to_ne_bytes();
-                    let _ = retry_write(failure.as_raw_fd(), &one);
-                }
-            })?;
-        worker_endpoints.push(worker_socket);
-        pumps.push(pump);
-    }
-    Ok((
-        worker_endpoints,
-        pumps,
-        controls,
-        lifecycle,
-        endpoint_failure,
-    ))
-}
-
-fn endpoint_pump(
-    endpoint: File,
-    proxy: UnixStream,
-    address: u8,
-    max_packet_size: usize,
-    lifecycle: Arc<(Mutex<PumpLifecycle>, Condvar)>,
-) -> io::Result<()> {
-    let mut frame = vec![0_u8; max_packet_size + 2];
-    loop {
-        let Some(epoch) = wait_for_endpoint_enable(&lifecycle, None)? else {
-            return Ok(());
-        };
-        if address & 0x80 != 0 {
-            let received = match retry_recv_packet(proxy.as_raw_fd(), &mut frame) {
-                Ok(received) => received,
-                Err(error) if endpoint_peer_closed(&error) => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            if received == 0 {
-                return Ok(());
-            }
-            if received < 2 {
-                return invalid(format!(
-                    "endpoint 0x{address:02x} received a truncated proxy packet"
-                ));
-            }
-            let length = u16::from_be_bytes([frame[0], frame[1]]) as usize;
-            if received != length + 2 || length > max_packet_size {
-                return invalid(format!(
-                    "endpoint 0x{address:02x} received an invalid proxy packet"
-                ));
-            }
-            let transferred = match retry_write(endpoint.as_raw_fd(), &frame[2..2 + length]) {
-                Ok(transferred) => transferred,
-                Err(error) if functionfs_generation_ended(&error) => {
-                    if wait_for_endpoint_enable(&lifecycle, Some(epoch))?.is_none() {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if transferred != length {
-                return short_endpoint_transfer(address);
-            }
-        } else {
-            let length = match retry_read(endpoint.as_raw_fd(), &mut frame[2..]) {
-                Ok(length) => length,
-                Err(error) if functionfs_generation_ended(&error) => {
-                    if wait_for_endpoint_enable(&lifecycle, Some(epoch))?.is_none() {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            frame[..2].copy_from_slice(&(length as u16).to_be_bytes());
-            let transferred = match retry_send_packet(proxy.as_raw_fd(), &frame[..2 + length]) {
-                Ok(transferred) => transferred,
-                Err(error) if endpoint_peer_closed(&error) => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            if transferred != length + 2 {
-                return short_endpoint_transfer(address);
-            }
-        }
-    }
-}
-
-fn wait_for_endpoint_enable(
-    lifecycle: &Arc<(Mutex<PumpLifecycle>, Condvar)>,
-    after_epoch: Option<u64>,
-) -> io::Result<Option<u64>> {
-    let (state, changed) = &**lifecycle;
-    let mut state = state
-        .lock()
-        .map_err(|_| io::Error::other("endpoint lifecycle lock poisoned"))?;
-    loop {
-        if state.stopping {
-            return Ok(None);
-        }
-        if state.enabled && after_epoch != Some(state.epoch) {
-            return Ok(Some(state.epoch));
-        }
-        state = changed
-            .wait(state)
-            .map_err(|_| io::Error::other("endpoint lifecycle lock poisoned"))?;
-    }
-}
-
-fn functionfs_generation_ended(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::ENODEV) | Some(libc::ESHUTDOWN)
-    )
-}
-
-fn endpoint_peer_closed(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::EPIPE) | Some(libc::ECONNRESET) | Some(libc::ESHUTDOWN)
-    )
-}
-
-fn retry_recv_packet(fd: i32, packet: &mut [u8]) -> io::Result<usize> {
-    retry_io(|| unsafe {
-        libc::recv(
-            fd,
-            packet.as_mut_ptr().cast(),
-            packet.len(),
-            libc::MSG_TRUNC,
-        )
-    })
-}
-
-fn retry_read(fd: i32, packet: &mut [u8]) -> io::Result<usize> {
-    retry_io(|| unsafe { libc::read(fd, packet.as_mut_ptr().cast(), packet.len()) })
-}
-
-fn retry_write(fd: i32, packet: &[u8]) -> io::Result<usize> {
-    retry_io(|| unsafe { libc::write(fd, packet.as_ptr().cast(), packet.len()) })
-}
-
-fn retry_send_packet(fd: i32, packet: &[u8]) -> io::Result<usize> {
-    retry_io(|| unsafe { libc::send(fd, packet.as_ptr().cast(), packet.len(), libc::MSG_NOSIGNAL) })
-}
-
-fn retry_io(mut operation: impl FnMut() -> libc::ssize_t) -> io::Result<usize> {
-    loop {
-        let result = operation();
-        if result >= 0 {
-            return Ok(result as usize);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-fn short_endpoint_transfer(address: u8) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::WriteZero,
-        format!("short endpoint 0x{address:02x} packet transfer"),
-    ))
-}
-
-fn stop_usb_generation(usb: UsbGeneration) -> io::Result<()> {
-    let UsbGeneration {
-        ep0,
-        endpoint_pumps,
-        pump_controls,
-        pump_lifecycle,
-        endpoint_failure: _,
-    } = usb;
-    let (state, changed) = &*pump_lifecycle;
-    if let Ok(mut state) = state.lock() {
-        state.stopping = true;
-        changed.notify_all();
-    }
-    for control in pump_controls {
-        let _ = control.shutdown(Shutdown::Both);
-    }
-    drop(ep0);
-    for pump in endpoint_pumps {
-        if pump.join().is_err() {
-            return Err(io::Error::other("FunctionFS endpoint pump panicked"));
-        }
-    }
-    Ok(())
-}
-
-fn eventfd() -> io::Result<File> {
-    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn drain_eventfd(fd: i32) -> io::Result<()> {
-    let mut value = 0_u64;
-    let length = unsafe {
-        libc::read(
-            fd,
-            (&mut value as *mut u64).cast::<c_void>(),
-            std::mem::size_of::<u64>(),
-        )
-    };
-    if length == std::mem::size_of::<u64>() as isize {
-        return Ok(());
-    }
-    if length < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
-        return Ok(());
-    }
-    Err(io::Error::other("invalid endpoint failure notification"))
 }
 
 fn expect_record(

@@ -42,10 +42,10 @@ device identity. Combining unrelated devices behind one composite VID/PID is
 not a compatibility goal.
 
 A worker publishes its typed USB personality as CBOR. The supervisor validates
-it, projects it into ConfigFS and FunctionFS, and retains the raw FunctionFS
-files. It forwards control/lifecycle events and preserves complete data packets
-over nonblocking endpoint proxy sockets. Typed Microsoft OS 1.0/WinUSB and
-WebUSB declarations travel in the same object.
+it, projects it into ConfigFS and FunctionFS, retains `ep0`, and passes the
+opened FunctionFS data endpoints directly to the worker. It forwards
+control/lifecycle events but stays out of the packet path. Typed Microsoft OS
+1.0/WinUSB and WebUSB declarations travel in the same object.
 
 ## Project boundaries
 
@@ -65,8 +65,8 @@ WebUSB declarations travel in the same object.
 - Root-owned profiles declare only the worker and privileged local resources;
   the worker remains the source of truth for USB identity and descriptors.
 - Workers communicate lifecycle and control state over a small versioned local
-  channel. Data packets use nonblocking packet-preserving endpoint proxies;
-  the supervisor never interprets their device protocol.
+  channel. Data packets use transferred FunctionFS endpoint capabilities;
+  the supervisor never receives their device protocol.
 - Invalid replacement USB configuration is rejected before the serving
   generation is disturbed.
 - A worker crash causes UDC unbind before teardown and process restart.
@@ -100,8 +100,8 @@ The supervisor:
   dropping privileges;
 - start one worker with the control socket and inherited local resources;
 - drop the worker to a configured unprivileged account;
-- validate the worker's CBOR USB personality, build FunctionFS, create endpoint
-  proxies, and bind only after the worker reports readiness; and
+- validate the worker's CBOR USB personality, build FunctionFS, transfer its
+  data endpoints, and bind only after the worker reports readiness; and
 - unbind immediately if the worker exits or violates the control protocol.
 
 It will not implement FIDO, CCID, Trezor, YubiHSM, cryptography, key storage, or
@@ -179,7 +179,7 @@ Profiles can be schema-checked without root or USB hardware:
 ```
 
 The selected worker receives a private `AF_UNIX/SOCK_SEQPACKET` control socket,
-state/runtime directory paths, generation-scoped endpoint proxy sockets
+state/runtime directory paths, generation-scoped FunctionFS endpoint files
 transferred with `SCM_RIGHTS`, and any profile-approved local-hardware file
 descriptors. FunctionFS paths are never exposed to the worker. This lets
 I2C and GPIO device nodes remain root-only while display and button semantics
