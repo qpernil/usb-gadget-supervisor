@@ -52,8 +52,8 @@ edge = "both"
 
 `name` is both the ConfigFS gadget name and the FunctionFS function name.
 `functionfs_mount` must be an absolute `/dev/ffs-*` path. The supervisor owns
-that mount; the worker receives endpoint proxy sockets and never opens the
-path itself.
+that mount; the worker receives only the already-opened data endpoint files and
+never opens the path itself.
 
 ## Worker
 

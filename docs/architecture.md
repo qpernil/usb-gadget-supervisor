@@ -11,16 +11,15 @@ UI, secrets, and persistent device state.
                         CBOR USB personality
 unprivileged worker -----------------------------> root supervisor
        ^                                                |
-       | control records + packet proxy sockets         | ConfigFS,
-       +------------------------------------------------+ FunctionFS, UDC
+       | control records + FunctionFS endpoint FDs      | ConfigFS,
+       +------------------------------------------------+ FunctionFS ep0, UDC
                                                         |
 host USB <---------------- Linux kernel <----------------+
 ```
 
-The supervisor owns every Linux FunctionFS file. It translates `ep0` events
-to typed control/lifecycle records and uses small generation-scoped pumps to
-preserve data-endpoint packets over nonblocking `SOCK_SEQPACKET` proxies. It
-does not interpret device-protocol payloads.
+The supervisor owns the FunctionFS mount and `ep0`. It translates `ep0` events
+to typed control/lifecycle records and passes the opened data-endpoint files to
+the worker. It never reads or writes device-protocol payloads.
 
 ## Ownership
 
@@ -33,9 +32,9 @@ does not interpret device-protocol payloads.
 | ConfigFS objects and FunctionFS publication | Supervisor |
 | UDC discovery, bind, unbind, and re-enumeration | Supervisor |
 | Worker credentials and process lifecycle | Supervisor |
-| FunctionFS `ep0` and blocking data endpoint files | Supervisor |
+| FunctionFS mount, `ep0`, and opening endpoint capabilities | Supervisor |
+| FunctionFS data endpoint I/O | Worker |
 | Runtime USB control meaning and firmware dispatch | Worker |
-| Packet-preserving endpoint pumps | Supervisor |
 | CTAP, CCID, Trezor, or YubiHSM endpoint traffic | Worker |
 | Private keys, wallet state, policy, display, buttons | Worker |
 
@@ -76,7 +75,7 @@ metadata. It then builds:
 - ConfigFS device/configuration attributes and strings;
 - ConfigFS Microsoft OS 1.0 and WebUSB attributes;
 - a FunctionFS v2 descriptor blob and string table; and
-- the ordered endpoint map used when transferring proxy FDs to the worker.
+- the ordered endpoint map used when transferring FunctionFS FDs to the worker.
 
 The kernel remains the final USB validator. The supervisor parser provides
 early diagnostics, prevents authority mismatches, and derives exactly the
@@ -97,8 +96,8 @@ Await Configure(0, request)
 Build generation 1
   create ConfigFS + FunctionFS
   publish descriptors
-  create FunctionFS endpoint pumps
-  send nonblocking endpoint proxies
+  open FunctionFS data endpoints
+  send endpoint capabilities
        |
        v
 Await Serving(1, request)
@@ -134,23 +133,23 @@ GPIO resources use Linux's v2 line API. The worker receives the line-request
 FD rather than the GPIO-chip FD, preserving exact line ownership, direction,
 bias, active-low interpretation, and edge subscription chosen by the profile.
 
-The USB endpoint capabilities are deliberately different. The worker receives
-only nonblocking packet sockets; the supervisor retains `ep0` and every raw
-FunctionFS endpoint. That keeps Linux blocking and cancellation rules out of
-device code and leaves room for future supervisor-side access control without
-exposing ConfigFS or FunctionFS authority.
+The worker receives only the already-opened, direction-specific FunctionFS data
+endpoints. The supervisor retains `ep0`, the mount, and all ConfigFS authority,
+but stays out of the packet path. The worker cannot open adjacent endpoints or
+reconfigure the gadget; its endpoint FDs are precise capabilities.
 
 ## Idle behavior
 
-The control socket, endpoint proxies, and GPIO event handles are pollable. A
-worker blocks in one kernel `poll` until USB, lifecycle, GPIO, or an internal
-deadline is ready. Supervisor pump threads absorb FunctionFS's synchronous
-endpoint waits. This reproduces the interrupt-or-timer wait that prevents a
-busy loop on real hardware while still servicing automatic lock, animations,
-retries, and other firmware deadlines.
+The control socket and GPIO event handles are pollable. A native worker may use
+the FunctionFS files directly from its own endpoint threads. A firmware worker
+can bridge each blocking FunctionFS file to a local packet-preserving queue,
+leaving its virtual controller and firmware loop single-threaded and pollable.
+This reproduces the interrupt-or-timer wait that prevents a busy loop on real
+hardware while still servicing automatic lock, animations, retries, and other
+firmware deadlines.
 
 Host suspend is not a generation boundary. The worker, firmware state,
-configuration, and proxies survive `SUSPEND`/`RESUME`; a reset-like
+configuration, and endpoint files survive `SUSPEND`/`RESUME`; a reset-like
 `DISABLE`/`ENABLE` sequence resets and reconfigures only the virtual USB
 controller. The complete mapping is in [USB lifecycle](usb-lifecycle.md).
 

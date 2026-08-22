@@ -28,12 +28,12 @@ representation:
 ep0, main OUT, main IN, U2F OUT, U2F IN
 ```
 
-It retains all five FunctionFS files. The worker receives four nonblocking,
-packet-preserving endpoint proxy sockets; `ep0` lifecycle and setup traffic is
-translated to control records. After the worker reports `Serving`, the
-supervisor binds the UDC. Setup requests are fed through the same virtual
-controller and genuine firmware control engine. Normal packets pass through
-opaque supervisor pumps to the upstream Trezor message decoder.
+It retains `ep0` and passes the four actual FunctionFS data endpoint files to
+the worker; `ep0` lifecycle and setup traffic is translated to control records.
+After the worker reports `Serving`, the supervisor binds the UDC. Setup requests
+are fed through the same virtual controller and genuine firmware control
+engine. Worker-owned endpoint helpers connect normal packets directly between
+FunctionFS and the upstream Trezor message decoder.
 
 The discovered normal configuration exposes the main vendor interface and the
 separate U2F HID interface, each with one 64-byte interrupt OUT endpoint and
@@ -74,7 +74,7 @@ display initialization.
 
 `usbReconnect()` rediscovers and republishes the firmware personality. The
 supervisor asks the same worker to quiesce, unbinds and rebuilds the gadget,
-passes replacement endpoint proxies, and binds again. The firmware process and
+passes replacement endpoint handles, and binds again. The firmware process and
 its state survive this USB re-enumeration. Host `SUSPEND`/`RESUME` also preserves
 the generation; a bus reset is represented by `DISABLE`/`ENABLE`. Worker
 failure remains the broader reset boundary and starts a fresh process. Only

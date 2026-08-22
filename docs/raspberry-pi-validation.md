@@ -46,7 +46,7 @@ and Trezor Suite.
 Inspect the worker process and confirm:
 
 - it runs as the configured non-root account;
-- it has the control socket and expected nonblocking endpoint-proxy/HID FDs;
+- it has the control socket and expected direction-specific FunctionFS/HID FDs;
 - it uses fixed descriptor 3 for control and has no descriptor-number or USB
   path environment variables;
 - FunctionFS mounts and HID nodes have not been made worker-owned; and

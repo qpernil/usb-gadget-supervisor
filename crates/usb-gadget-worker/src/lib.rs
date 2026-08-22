@@ -6,6 +6,53 @@ use std::io::{self, Cursor};
 mod discovery;
 pub use discovery::{discover, SetupPacket};
 
+pub const USB_BUS_EVENT_BODY_LENGTH: usize = 9;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum UsbBusEvent {
+    Bind = 0,
+    Unbind = 1,
+    Enable = 2,
+    Disable = 3,
+    Suspend = 5,
+    Resume = 6,
+}
+
+impl UsbBusEvent {
+    pub fn from_byte(value: u8) -> io::Result<Self> {
+        match value {
+            0 => Ok(Self::Bind),
+            1 => Ok(Self::Unbind),
+            2 => Ok(Self::Enable),
+            3 => Ok(Self::Disable),
+            5 => Ok(Self::Suspend),
+            6 => Ok(Self::Resume),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown USB bus event {value}"),
+            )),
+        }
+    }
+
+    pub fn encode(self, activation: u64) -> [u8; USB_BUS_EVENT_BODY_LENGTH] {
+        let mut body = [0_u8; USB_BUS_EVENT_BODY_LENGTH];
+        body[0] = self as u8;
+        body[1..].copy_from_slice(&activation.to_be_bytes());
+        body
+    }
+
+    pub fn decode(body: &[u8]) -> io::Result<(Self, u64)> {
+        let body: &[u8; USB_BUS_EVENT_BODY_LENGTH] = body.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid USB bus event body")
+        })?;
+        Ok((
+            Self::from_byte(body[0])?,
+            u64::from_be_bytes(body[1..].try_into().unwrap()),
+        ))
+    }
+}
+
 pub const PERSONALITY_SCHEMA: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -221,5 +268,14 @@ mod tests {
         let decoded = UsbPersonality::from_cbor(&encoded).unwrap();
         assert_eq!(decoded.max_speed, UsbSpeed::FullSpeed);
         assert_eq!(decoded.strings[0].descriptor, [4, 3, b'A', 0]);
+    }
+
+    #[test]
+    fn bus_events_carry_activation() {
+        let event = UsbBusEvent::Enable.encode(0x0102_0304_0506_0708);
+        assert_eq!(
+            UsbBusEvent::decode(&event).unwrap(),
+            (UsbBusEvent::Enable, 0x0102_0304_0506_0708)
+        );
     }
 }
