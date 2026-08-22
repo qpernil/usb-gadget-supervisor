@@ -41,20 +41,19 @@ is an intentional USB disconnect followed by re-enumeration with a different
 device identity. Combining unrelated devices behind one composite VID/PID is
 not a compatibility goal.
 
-Endpoint data is never proxied through the supervisor. The supervisor validates
-and publishes profile-owned FunctionFS descriptors, then transfers the open
-endpoint files to the worker. The supervisor retains control only over gadget
-configuration and lifecycle. Device profiles may also request validated
-Microsoft OS 1.0/WinUSB metadata and a WebUSB BOS capability; the supervisor
-publishes their required global ConfigFS settings.
+A worker publishes its typed USB personality as CBOR. The supervisor validates
+it, projects it into ConfigFS and FunctionFS, and retains the raw FunctionFS
+files. It forwards control/lifecycle events and preserves complete data packets
+over nonblocking endpoint proxy sockets. Typed Microsoft OS 1.0/WinUSB and
+WebUSB declarations travel in the same object.
 
 ## Project boundaries
 
 | Project | Responsibility |
 | --- | --- |
-| `usb-gadget-supervisor` | ConfigFS, FunctionFS mounts, UDC ownership, privilege dropping, worker readiness, bind/unbind, cleanup |
-| [`virtual-yubikey`](https://github.com/qpernil/virtual-yubikey) | YubiKey USB profile, FIDO HID, CCID, Management, PIV, FIDO2, state |
-| `virtual-trezor` | Upstream Trezor firmware build, Pi HAL, Trezor descriptors, OLED/buttons, state |
+| `usb-gadget-supervisor` | CBOR USB schema/discovery helper, ConfigFS, FunctionFS, UDC ownership, privilege dropping, bind/unbind/reconfiguration, cleanup |
+| [`virtual-yubikey`](https://github.com/qpernil/virtual-yubikey) | Future native YubiKey personality publisher, FIDO, CCID, Management, PIV, FIDO2, state |
+| `virtual-trezor` | Upstream firmware build and descriptor discovery, Pi HAL, OLED/buttons, state |
 | `virtual-yubihsm` | YubiHSM protocol, sessions, objects, capabilities, audit, state |
 
 ## Design principles
@@ -63,11 +62,14 @@ publishes their required global ConfigFS settings.
   implementation.
 - Workers run as an explicitly selected non-root account with no path back to
   root.
-- Device profiles are declarative, root-owned, strictly validated, and owned by
-  the corresponding device project rather than compiled into the supervisor.
-- Workers communicate lifecycle state over a small versioned local control
-  channel. USB payloads stay on FunctionFS or dedicated HID endpoint files.
-- A worker crash causes immediate UDC unbind before teardown or restart.
+- Root-owned profiles declare only the worker and privileged local resources;
+  the worker remains the source of truth for USB identity and descriptors.
+- Workers communicate lifecycle and control state over a small versioned local
+  channel. Data packets use nonblocking packet-preserving endpoint proxies;
+  the supervisor never interprets their device protocol.
+- Invalid replacement USB configuration is rejected before the serving
+  generation is disturbed.
+- A worker crash causes UDC unbind before teardown and process restart.
 - `systemctl reload` requests the same clean incarnation rebuild without
   restarting the supervisor process.
 - The supervisor does not pretend that one UDC can expose multiple independent
@@ -83,9 +85,10 @@ The supervisor:
 - create and tear down ConfigFS gadgets and FunctionFS mounts;
 - open declared local character devices and claim exact GPIO line groups before
   dropping privileges;
-- start one worker with inherited endpoint and control descriptors;
+- start one worker with the control socket and inherited local resources;
 - drop the worker to a configured unprivileged account;
-- bind the gadget only after the worker reports readiness; and
+- validate the worker's CBOR USB personality, build FunctionFS, create endpoint
+  proxies, and bind only after the worker reports readiness; and
 - unbind immediately if the worker exits or violates the control protocol.
 
 It will not implement FIDO, CCID, Trezor, YubiHSM, cryptography, key storage, or
@@ -163,9 +166,9 @@ Profiles can be schema-checked without root or USB hardware:
 ```
 
 The selected worker receives a private `AF_UNIX/SOCK_SEQPACKET` control socket,
-state/runtime directory paths, exact USB file-descriptor bundles transferred
-with `SCM_RIGHTS`, and any profile-approved local-hardware file descriptors.
-FunctionFS and HID paths are never exposed to the worker. This lets
+state/runtime directory paths, generation-scoped endpoint proxy sockets
+transferred with `SCM_RIGHTS`, and any profile-approved local-hardware file
+descriptors. FunctionFS paths are never exposed to the worker. This lets
 I2C and GPIO device nodes remain root-only while display and button semantics
 stay entirely inside the device worker. See the
 [worker protocol](docs/worker-protocol.md) for the exact contract.
@@ -174,18 +177,19 @@ stay entirely inside the device worker. See the
 
 - [Architecture](docs/architecture.md)
 - [Worker protocol](docs/worker-protocol.md)
+- [USB lifecycle and host sleep](docs/usb-lifecycle.md)
 - [Profile format](docs/profile-format.md)
 - [Trezor One worker](docs/trezor-one.md)
 - [Raspberry Pi validation](docs/raspberry-pi-validation.md)
 
 ## Status
 
-The supervisor, Virtual YubiKey worker, and Virtual Trezor worker implement the
-same fixed version-1 resource protocol and schema-1 profiles. Profile parsing is
-strict, FunctionFS resources are derived from installed descriptor blobs, and
-USB FDs are passed with `SCM_RIGHTS`. Unit tests and Raspberry Pi-targeted Rust
-type checks pass. Run the hardware checklist before treating a profile as
-deployable.
+The supervisor and Virtual Trezor implement the version-1 generation protocol.
+The legacy firmware answers real control requests through the shared discovery
+parser; the resulting CBOR personality drives ConfigFS and FunctionFS. Virtual
+YubiKey has not yet been migrated to this intentionally incompatible protocol.
+Unit tests and Raspberry Pi-targeted Rust type checks pass; run the hardware
+checklist before treating a profile as deployable.
 
 ## Contributing
 

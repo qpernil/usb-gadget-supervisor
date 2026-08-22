@@ -1,5 +1,6 @@
 .DS_Store
 /target/
+/crates/*/target/
 *.swp
 *.swo
 .idea/

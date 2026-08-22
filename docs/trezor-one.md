@@ -14,23 +14,30 @@ defines the boundary relevant to the supervisor.
 
 ## USB boundary
 
-The profile contains the FunctionFS descriptor and string blobs for the main
-Trezor vendor interface. The supervisor validates those blobs, derives one OUT
-and one IN endpoint, publishes the blobs to FunctionFS, and opens:
+The disk profile contains no USB bytes. At startup the worker initializes the
+genuine legacy `libopencm3` USB stack against a virtual controller. The shared
+discovery parser issues control requests through that controller, so the real
+firmware code returns its device, configuration, string, Microsoft OS 1.0, and
+WebUSB descriptors. The parser returns one typed CBOR personality.
+
+The supervisor validates that object, derives both firmware interfaces and
+their four data endpoints, and publishes the corresponding FunctionFS
+representation:
 
 ```text
-ep0, OUT, IN
+ep0, main OUT, main IN, U2F OUT, U2F IN
 ```
 
-It transfers the three descriptors to the unprivileged worker in the fixed
-pre-bind resource bundle. The worker reports `PREPARED`, the supervisor binds
-the UDC, and the worker reports `SERVING` after FunctionFS signals that the
-interface is enabled. Normal USB packets then move directly between the host,
-the FunctionFS endpoint descriptors, and the upstream Trezor message decoder;
-the supervisor does not proxy or interpret them.
+It retains all five FunctionFS files. The worker receives four nonblocking,
+packet-preserving endpoint proxy sockets; `ep0` lifecycle and setup traffic is
+translated to control records. After the worker reports `Serving`, the
+supervisor binds the UDC. Setup requests are fed through the same virtual
+controller and genuine firmware control engine. Normal packets pass through
+opaque supervisor pumps to the upstream Trezor message decoder.
 
-The current profile exposes only the main vendor interface. DebugLink and the
-separate U2F HID interface are not exposed.
+The discovered normal configuration exposes the main vendor interface and the
+separate U2F HID interface, each with one 64-byte interrupt OUT endpoint and
+one 64-byte interrupt IN endpoint. DebugLink remains disabled.
 
 The FunctionFS blob also carries the upstream-compatible Microsoft OS 1.0
 features for interface zero: compatible ID `WINUSB` and
@@ -65,10 +72,12 @@ display initialization.
 
 ## Lifecycle
 
-`usbReconnect()` exits the worker. Control-socket EOF tells the still-running
-supervisor to unbind the UDC, remove the complete gadget incarnation, create a
-new worker with fresh descriptors, and bind again. Stopping the supervisor
-service performs the same teardown without starting another incarnation. Only
+`usbReconnect()` rediscovers and republishes the firmware personality. The
+supervisor asks the same worker to quiesce, unbinds and rebuilds the gadget,
+passes replacement endpoint proxies, and binds again. The firmware process and
+its state survive this USB re-enumeration. Host `SUSPEND`/`RESUME` also preserves
+the generation; a bus reset is represented by `DISABLE`/`ENABLE`. Worker
+failure remains the broader reset boundary and starts a fresh process. Only
 the supervisor writes the UDC attribute.
 
 ## Process boundary

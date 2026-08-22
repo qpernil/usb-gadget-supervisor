@@ -10,10 +10,15 @@ keywords = ["raspberry-pi", "usb-gadget", "functionfs", "configfs"]
 categories = ["hardware-support", "command-line-utilities"]
 publish = false
 
+[workspace]
+members = ["crates/usb-gadget-worker"]
+resolver = "2"
+
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "0.9.12"
+libc = "0.2.189"
+usb-gadget-worker = { path = "crates/usb-gadget-worker" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpiocdev-uapi = "0.7.0"
-libc = "0.2.189"

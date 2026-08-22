@@ -1,4 +1,3 @@
-use crate::functionfs;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
@@ -10,11 +9,10 @@ use std::path::{Path, PathBuf};
 pub(crate) struct Profile {
     pub(crate) schema: u32,
     pub(crate) name: String,
-    pub(crate) usb: UsbProfile,
+    pub(crate) functionfs_mount: PathBuf,
     pub(crate) worker: WorkerProfile,
     #[serde(default)]
     pub(crate) resources: Vec<ResourceProfile>,
-    pub(crate) functions: Vec<FunctionProfile>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -95,42 +93,6 @@ pub(crate) enum GpioEdge {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct UsbProfile {
-    pub(crate) vendor_id: u16,
-    pub(crate) product_id: u16,
-    pub(crate) bcd_usb: u16,
-    pub(crate) bcd_device: u16,
-    pub(crate) max_speed: String,
-    pub(crate) device_class: u8,
-    pub(crate) device_subclass: u8,
-    pub(crate) device_protocol: u8,
-    pub(crate) manufacturer: String,
-    pub(crate) product: String,
-    pub(crate) serial: Option<String>,
-    pub(crate) max_power_ma: u16,
-    #[serde(default)]
-    pub(crate) microsoft_os_1: Option<MicrosoftOs10Profile>,
-    #[serde(default)]
-    pub(crate) webusb: Option<WebUsbProfile>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct MicrosoftOs10Profile {
-    pub(crate) vendor_code: u8,
-    pub(crate) signature: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WebUsbProfile {
-    pub(crate) version: u16,
-    pub(crate) vendor_code: u8,
-    pub(crate) landing_page: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct WorkerProfile {
     pub(crate) command: PathBuf,
     #[serde(default)]
@@ -139,34 +101,6 @@ pub(crate) struct WorkerProfile {
     pub(crate) readiness_timeout_ms: u64,
     pub(crate) state_directory: PathBuf,
     pub(crate) runtime_directory: PathBuf,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub(crate) enum FunctionProfile {
-    Hid(HidFunction),
-    Functionfs(FunctionFsFunction),
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct HidFunction {
-    pub(crate) name: String,
-    pub(crate) protocol: u8,
-    pub(crate) subclass: u8,
-    pub(crate) report_length: u16,
-    pub(crate) report_descriptor: Option<PathBuf>,
-    pub(crate) report_descriptor_hex: Option<String>,
-    pub(crate) device: PathBuf,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FunctionFsFunction {
-    pub(crate) name: String,
-    pub(crate) mount: PathBuf,
-    pub(crate) descriptors_hex: String,
-    pub(crate) strings_hex: String,
 }
 
 impl Profile {
@@ -192,52 +126,19 @@ impl Profile {
             return invalid(format!("unsupported profile schema {}", self.schema));
         }
         validate_name("profile", &self.name)?;
-        if !matches!(
-            self.usb.max_speed.as_str(),
-            "low-speed" | "full-speed" | "high-speed"
-        ) {
-            return invalid("usb.max_speed must be low-speed, full-speed, or high-speed");
+        validate_absolute("functionfs_mount", &self.functionfs_mount)?;
+        let mount_name = self
+            .functionfs_mount
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if self.functionfs_mount.parent() != Some(Path::new("/dev"))
+            || !mount_name.starts_with("ffs-")
+            || mount_name.len() == 4
+        {
+            return invalid("functionfs_mount must use the /dev/ffs-* namespace");
         }
-        if self.usb.manufacturer.is_empty() || self.usb.product.is_empty() {
-            return invalid("USB manufacturer and product strings must not be empty");
-        }
-        if self.usb.max_power_ma == 0 || self.usb.max_power_ma > 500 {
-            return invalid("usb.max_power_ma must be between 1 and 500");
-        }
-        if let Some(serial) = &self.usb.serial {
-            if serial.is_empty() || serial.len() > 126 {
-                return invalid("usb.serial must contain 1 to 126 bytes when present");
-            }
-        }
-        if let Some(microsoft) = &self.usb.microsoft_os_1 {
-            if microsoft.vendor_code == 0 {
-                return invalid("usb.microsoft_os_1.vendor_code must not be zero");
-            }
-            if microsoft.signature != "MSFT100" {
-                return invalid("usb.microsoft_os_1.signature must be MSFT100");
-            }
-        }
-        if let Some(webusb) = &self.usb.webusb {
-            if self.usb.bcd_usb < 0x0201 {
-                return invalid("usb.bcd_usb must be at least 0x0201 when WebUSB is enabled");
-            }
-            if webusb.version != 0x0100 {
-                return invalid("usb.webusb.version must be 0x0100");
-            }
-            if webusb.vendor_code == 0 {
-                return invalid("usb.webusb.vendor_code must not be zero");
-            }
-            if webusb.landing_page.len() > 252
-                || !webusb.landing_page.is_ascii()
-                || (!webusb.landing_page.is_empty()
-                    && !webusb.landing_page.starts_with("https://")
-                    && !webusb.landing_page.starts_with("http://"))
-            {
-                return invalid(
-                    "usb.webusb.landing_page must be empty or an ASCII HTTP(S) URL up to 252 bytes",
-                );
-            }
-        }
+
         validate_absolute("worker.command", &self.worker.command)?;
         validate_directory_under(
             "worker.state_directory",
@@ -255,9 +156,6 @@ impl Profile {
         }
         if self.worker.readiness_timeout_ms == 0 || self.worker.readiness_timeout_ms > 120_000 {
             return invalid("worker.readiness_timeout_ms must be between 1 and 120000");
-        }
-        if self.functions.is_empty() {
-            return invalid("the profile must declare at least one function");
         }
 
         let mut resource_names = HashSet::new();
@@ -340,97 +238,6 @@ impl Profile {
                 }
             }
         }
-
-        let mut names = HashSet::new();
-        let mut mounts = HashSet::new();
-        let mut devices = HashSet::new();
-        let mut has_ms_os_descriptors = false;
-        for function in &self.functions {
-            match function {
-                FunctionProfile::Hid(hid) => {
-                    validate_name("HID function", &hid.name)?;
-                    if !names.insert(hid.name.as_str()) {
-                        return invalid(format!("duplicate function name {:?}", hid.name));
-                    }
-                    if hid.report_length == 0 || hid.report_length > 4096 {
-                        return invalid("HID report_length must be between 1 and 4096");
-                    }
-                    match (&hid.report_descriptor, &hid.report_descriptor_hex) {
-                        (Some(path), None) => {
-                            validate_absolute("HID report_descriptor", path)?;
-                        }
-                        (None, Some(descriptor)) => {
-                            decode_hex_descriptor(descriptor, "inline HID report descriptor")?;
-                        }
-                        (None, None) => {
-                            return invalid(
-                                "HID functions need report_descriptor or report_descriptor_hex",
-                            );
-                        }
-                        (Some(_), Some(_)) => {
-                            return invalid(
-                                "HID functions must not set both report_descriptor and report_descriptor_hex",
-                            );
-                        }
-                    }
-                    validate_absolute("HID device", &hid.device)?;
-                    let device_name = hid
-                        .device
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default();
-                    if hid.device.parent() != Some(Path::new("/dev"))
-                        || !device_name.starts_with("hidg")
-                        || device_name[4..].is_empty()
-                        || !device_name[4..].bytes().all(|byte| byte.is_ascii_digit())
-                    {
-                        return invalid("HID device paths must use the /dev/hidg* namespace");
-                    }
-                    if !devices.insert(hid.device.as_path()) {
-                        return invalid(format!("duplicate HID device {}", hid.device.display()));
-                    }
-                }
-                FunctionProfile::Functionfs(ffs) => {
-                    validate_name("FunctionFS function", &ffs.name)?;
-                    if !names.insert(ffs.name.as_str()) {
-                        return invalid(format!("duplicate function name {:?}", ffs.name));
-                    }
-                    validate_absolute("FunctionFS mount", &ffs.mount)?;
-                    let mount_name = ffs
-                        .mount
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default();
-                    if ffs.mount.parent() != Some(Path::new("/dev"))
-                        || !mount_name.starts_with("ffs-")
-                        || mount_name.len() == 4
-                    {
-                        return invalid("FunctionFS mounts must use the /dev/ffs-* namespace");
-                    }
-                    if !mounts.insert(ffs.mount.as_path()) {
-                        return invalid(format!(
-                            "duplicate FunctionFS mount {}",
-                            ffs.mount.display()
-                        ));
-                    }
-                    let descriptors = decode_hex_blob(
-                        &ffs.descriptors_hex,
-                        &format!("FunctionFS {} descriptors", ffs.name),
-                    )?;
-                    let strings = decode_hex_blob(
-                        &ffs.strings_hex,
-                        &format!("FunctionFS {} strings", ffs.name),
-                    )?;
-                    let inspection = functionfs::inspect(&descriptors, &strings)?;
-                    has_ms_os_descriptors |= inspection.has_ms_os_descriptors;
-                }
-            }
-        }
-        if has_ms_os_descriptors != self.usb.microsoft_os_1.is_some() {
-            return invalid(
-                "usb.microsoft_os_1 and FunctionFS Microsoft OS descriptors must be declared together",
-            );
-        }
         Ok(())
     }
 }
@@ -484,29 +291,6 @@ fn invalid<T>(message: impl Into<String>) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
 }
 
-pub(crate) fn decode_hex_blob(source: &str, label: &str) -> io::Result<Vec<u8>> {
-    let mut descriptor = Vec::new();
-    for token in source.split_whitespace() {
-        descriptor.push(u8::from_str_radix(token, 16).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid hexadecimal byte {token:?} in {label}"),
-            )
-        })?);
-    }
-    if descriptor.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{label} is empty"),
-        ));
-    }
-    Ok(descriptor)
-}
-
-pub(crate) fn decode_hex_descriptor(source: &str, label: &str) -> io::Result<Vec<u8>> {
-    decode_hex_blob(source, label)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,19 +298,7 @@ mod tests {
     const VALID: &str = r#"
 schema = 1
 name = "test-device"
-
-[usb]
-vendor_id = 0x1209
-product_id = 0x0001
-bcd_usb = 0x0200
-bcd_device = 0x0100
-max_speed = "full-speed"
-device_class = 0
-device_subclass = 0
-device_protocol = 0
-manufacturer = "Example"
-product = "Test Device"
-max_power_ma = 50
+functionfs_mount = "/dev/ffs-test-device"
 
 [worker]
 command = "/usr/libexec/test-worker"
@@ -535,166 +307,40 @@ run_as = "device-worker"
 readiness_timeout_ms = 10000
 state_directory = "/var/lib/test-device"
 runtime_directory = "/run/test-device"
-
-[[functions]]
-type = "functionfs"
-name = "main"
-mount = "/dev/ffs-test-device"
-descriptors_hex = "03 00 00 00 27 00 00 00 01 00 00 00 03 00 00 00 09 04 00 00 02 ff 00 00 00 07 05 01 02 40 00 00 07 05 81 02 40 00 00"
-strings_hex = "02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00"
 "#;
 
     #[test]
-    fn strictly_parses_a_valid_profile() {
+    fn parses_a_descriptor_free_profile() {
         let profile: Profile = toml::from_str(VALID).unwrap();
         profile.validate().unwrap();
-        assert_eq!(profile.usb.vendor_id, 0x1209);
-        assert_eq!(profile.functions.len(), 1);
+        assert_eq!(profile.functionfs_mount, Path::new("/dev/ffs-test-device"));
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let error = toml::from_str::<Profile>(&format!("{VALID}\nsecret = true\n")).unwrap_err();
-        assert!(error.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn rejects_microsoft_os_settings_without_functionfs_os_descriptors() {
-        let source =
-            format!("{VALID}\n[usb.microsoft_os_1]\nvendor_code = 0x21\nsignature = \"MSFT100\"\n");
-        assert!(toml::from_str::<Profile>(&source)
-            .unwrap()
-            .validate()
-            .is_err());
+    fn rejects_unknown_and_legacy_usb_fields() {
+        assert!(toml::from_str::<Profile>(&format!("{VALID}\n[usb]\nvendor_id = 1\n")).is_err());
     }
 
     #[test]
     fn rejects_a_root_worker() {
         let profile: Profile = toml::from_str(&VALID.replace("device-worker", "root")).unwrap();
-        assert_eq!(
-            profile.validate().unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-    }
-
-    #[test]
-    fn rejects_broad_worker_directories() {
-        let profile: Profile = toml::from_str(&VALID.replace(
-            "state_directory = \"/var/lib/test-device\"",
-            "state_directory = \"/var/lib\"",
-        ))
-        .unwrap();
         assert!(profile.validate().is_err());
     }
 
     #[test]
-    fn accepts_distinct_function_names_without_environment_normalization() {
-        let source = format!(
-            "{VALID}\n[[functions]]\ntype = \"functionfs\"\nname = \"ma-in\"\nmount = \"/dev/ffs-second\"\ndescriptors_hex = \"03 00 00 00 27 00 00 00 01 00 00 00 03 00 00 00 09 04 00 00 02 ff 00 00 00 07 05 01 02 40 00 00 07 05 81 02 40 00 00\"\nstrings_hex = \"02 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00\"\n\n[[functions]]\ntype = \"hid\"\nname = \"ma_in\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor = \"/usr/share/test.hex\"\ndevice = \"/dev/hidg0\"\n"
+    fn validates_gpio_ownership_and_initial_values() {
+        let valid = format!(
+            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"buttons\"\npath = \"/dev/gpiochip0\"\noffsets = [5, 26, 13]\ndirection = \"input\"\nactive_low = true\nbias = \"pull-up\"\nedge = \"both\"\n"
         );
-        let profile: Profile = toml::from_str(&source).unwrap();
-        profile.validate().unwrap();
-    }
-
-    #[test]
-    fn accepts_an_inline_hid_report_descriptor() {
-        let source = format!(
-            "{VALID}\n[[functions]]\ntype = \"hid\"\nname = \"fido\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor_hex = \"06 d0 f1 09 01 c0\"\ndevice = \"/dev/hidg0\"\n"
-        );
-        let profile: Profile = toml::from_str(&source).unwrap();
-        profile.validate().unwrap();
-    }
-
-    #[test]
-    fn rejects_missing_or_ambiguous_hid_report_descriptors() {
-        let missing = format!(
-            "{VALID}\n[[functions]]\ntype = \"hid\"\nname = \"fido\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\ndevice = \"/dev/hidg0\"\n"
-        );
-        assert!(toml::from_str::<Profile>(&missing)
+        toml::from_str::<Profile>(&valid)
             .unwrap()
             .validate()
-            .is_err());
+            .unwrap();
 
-        let both = format!(
-            "{VALID}\n[[functions]]\ntype = \"hid\"\nname = \"fido\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor = \"/usr/share/test.hex\"\nreport_descriptor_hex = \"06 d0 f1 09 01 c0\"\ndevice = \"/dev/hidg0\"\n"
+        let invalid = format!(
+            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"display\"\npath = \"/dev/gpiochip0\"\noffsets = [24, 25]\ndirection = \"output\"\ninitial_values = [false]\n"
         );
-        assert!(toml::from_str::<Profile>(&both)
-            .unwrap()
-            .validate()
-            .is_err());
-
-        let invalid_hex = format!(
-            "{VALID}\n[[functions]]\ntype = \"hid\"\nname = \"fido\"\nprotocol = 0\nsubclass = 0\nreport_length = 64\nreport_descriptor_hex = \"not-hex\"\ndevice = \"/dev/hidg0\"\n"
-        );
-        assert!(toml::from_str::<Profile>(&invalid_hex)
-            .unwrap()
-            .validate()
-            .is_err());
-    }
-
-    #[test]
-    fn parses_required_device_resources() {
-        let source = format!(
-            "{VALID}\n[[resources]]\ntype = \"character-device\"\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\n"
-        );
-        let profile: Profile = toml::from_str(&source).unwrap();
-        profile.validate().unwrap();
-        assert_eq!(profile.resources.len(), 1);
-    }
-
-    #[test]
-    fn rejects_optional_resource_slots() {
-        let source = format!(
-            "{VALID}\n[[resources]]\ntype = \"character-device\"\nname = \"display-i2c\"\npath = \"/dev/i2c-1\"\naccess = \"read-write\"\noptional = true\n"
-        );
-        assert!(toml::from_str::<Profile>(&source).is_err());
-    }
-
-    #[test]
-    fn accepts_disjoint_gpio_groups_on_one_chip() {
-        let source = format!(
-            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"display-control\"\npath = \"/dev/gpiochip0\"\noffsets = [25, 27, 24]\ndirection = \"output\"\ninitial_values = [false, false, false]\n\n[[resources]]\ntype = \"gpio-lines\"\nname = \"buttons\"\npath = \"/dev/gpiochip0\"\noffsets = [5, 26, 13]\ndirection = \"input\"\nactive_low = true\nbias = \"pull-up\"\nedge = \"both\"\n"
-        );
-        let profile: Profile = toml::from_str(&source).unwrap();
-        profile.validate().unwrap();
-    }
-
-    #[test]
-    fn rejects_overlapping_gpio_groups() {
-        let source = format!(
-            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"first\"\npath = \"/dev/gpiochip0\"\noffsets = [5, 26]\ndirection = \"input\"\n\n[[resources]]\ntype = \"gpio-lines\"\nname = \"second\"\npath = \"/dev/gpiochip0\"\noffsets = [26, 13]\ndirection = \"input\"\n"
-        );
-        assert!(toml::from_str::<Profile>(&source)
-            .unwrap()
-            .validate()
-            .is_err());
-    }
-
-    #[test]
-    fn requires_one_initial_value_per_output_line() {
-        let missing = format!(
-            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"display-control\"\npath = \"/dev/gpiochip0\"\noffsets = [24, 25]\ndirection = \"output\"\n"
-        );
-        assert!(toml::from_str::<Profile>(&missing)
-            .unwrap()
-            .validate()
-            .is_err());
-
-        let wrong_count = format!(
-            "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"display-control\"\npath = \"/dev/gpiochip0\"\noffsets = [24, 25]\ndirection = \"output\"\ninitial_values = [false]\n"
-        );
-        assert!(toml::from_str::<Profile>(&wrong_count)
-            .unwrap()
-            .validate()
-            .is_err());
-    }
-
-    #[test]
-    fn rejects_a_raw_gpio_chip_character_device() {
-        let source = format!(
-            "{VALID}\n[[resources]]\ntype = \"character-device\"\nname = \"gpio\"\npath = \"/dev/gpiochip0\"\naccess = \"read-write\"\n"
-        );
-        assert!(toml::from_str::<Profile>(&source)
+        assert!(toml::from_str::<Profile>(&invalid)
             .unwrap()
             .validate()
             .is_err());
