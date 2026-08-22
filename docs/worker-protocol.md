@@ -159,6 +159,9 @@ disconnect and full re-enumeration while firmware state survives.
 `SIGHUP` deliberately has the broader meaning: re-read the root-owned profile,
 tear down the current generation and worker, and start a fresh worker. Worker
 exit or control-channel EOF takes the same fresh-incarnation recovery path.
+For an intentional replacement or service stop, the supervisor closes its
+control-channel endpoint and waits for the worker's normal EOF-driven exit.
+`SIGTERM` and then `SIGKILL` are bounded fallbacks only for a wedged worker.
 
 ## Data path
 

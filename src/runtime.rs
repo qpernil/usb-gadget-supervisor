@@ -289,12 +289,13 @@ impl Runtime {
                 Ok(())
             });
         }
-        let mut child = command.spawn()?;
+        let child = command.spawn()?;
         drop(worker_channel);
         let body = resource_names(&self.profile.resources)?;
         let record = Record::new(Kind::InitialResources, 0, 0, body);
         if let Err(error) = protocol::send(&supervisor, &record, &resources) {
-            let _ = terminate_child(&mut child);
+            drop(supervisor);
+            let _ = stop_worker(&mut Some(child));
             return Err(io::Error::new(
                 error.kind(),
                 format!("worker did not initialize: {error}"),
@@ -1488,17 +1489,30 @@ fn stop_worker(worker: &mut Option<Child>) -> io::Result<()> {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    terminate_child(&mut child)
+    if child.try_wait()?.is_none() {
+        signal_child(&child, libc::SIGTERM)?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if child.try_wait()?.is_none() {
+        signal_child(&child, libc::SIGKILL)?;
+    }
+    child.wait().map(|_| ())
 }
 
-fn terminate_child(child: &mut Child) -> io::Result<()> {
-    if child.try_wait()?.is_none() && unsafe { libc::kill(child.id() as _, libc::SIGTERM) } != 0 {
+fn signal_child(child: &Child, signal: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::kill(child.id() as _, signal) } != 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
             return Err(error);
         }
     }
-    child.wait().map(|_| ())
+    Ok(())
 }
 
 fn write_attribute(path: &Path, value: &str) -> io::Result<()> {
