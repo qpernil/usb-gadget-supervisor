@@ -1,7 +1,11 @@
 //! Shared worker-side model for publishing USB personalities to the supervisor.
 
 use serde::{Deserialize, Serialize};
+use std::ffi::{c_char, CStr};
 use std::io::{self, Cursor};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ptr;
+use std::slice;
 
 mod discovery;
 pub use discovery::{discover, SetupPacket};
@@ -140,6 +144,99 @@ impl UsbPersonality {
     }
 }
 
+/// The single construction path for both firmware discovery and native
+/// workers. Discovery supplies the descriptor bytes returned by firmware;
+/// native adapters may first construct those bytes from their platform USB
+/// configuration calls.
+#[derive(Clone, Debug)]
+pub struct UsbPersonalityBuilder {
+    max_speed: UsbSpeed,
+    device_descriptor: Option<Vec<u8>>,
+    configuration_descriptor: Option<Vec<u8>>,
+    strings: Vec<StringDescriptor>,
+    microsoft_os_1: Option<MicrosoftOs10>,
+    webusb: Option<WebUsb>,
+}
+
+impl UsbPersonalityBuilder {
+    pub fn new(max_speed: UsbSpeed) -> Self {
+        Self {
+            max_speed,
+            device_descriptor: None,
+            configuration_descriptor: None,
+            strings: Vec::new(),
+            microsoft_os_1: None,
+            webusb: None,
+        }
+    }
+
+    pub fn device_descriptor(&mut self, descriptor: impl Into<Vec<u8>>) -> &mut Self {
+        self.device_descriptor = Some(descriptor.into());
+        self
+    }
+
+    pub fn configuration_descriptor(&mut self, descriptor: impl Into<Vec<u8>>) -> &mut Self {
+        self.configuration_descriptor = Some(descriptor.into());
+        self
+    }
+
+    pub fn string_descriptor(&mut self, descriptor: StringDescriptor) -> &mut Self {
+        self.strings.push(descriptor);
+        self
+    }
+
+    pub fn microsoft_os_1(&mut self, capability: MicrosoftOs10) -> &mut Self {
+        self.microsoft_os_1 = Some(capability);
+        self
+    }
+
+    pub fn webusb(&mut self, capability: WebUsb) -> &mut Self {
+        self.webusb = Some(capability);
+        self
+    }
+
+    pub fn finish(self) -> io::Result<UsbPersonality> {
+        let device_descriptor = self.device_descriptor.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing USB device descriptor")
+        })?;
+        let configuration_descriptor = self.configuration_descriptor.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing USB configuration descriptor",
+            )
+        })?;
+        if device_descriptor.len() != 18 || device_descriptor[0] != 18 || device_descriptor[1] != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid USB device descriptor",
+            ));
+        }
+        if configuration_descriptor.len() < 9
+            || configuration_descriptor[0] != 9
+            || configuration_descriptor[1] != 2
+            || usize::from(u16::from_le_bytes([
+                configuration_descriptor[2],
+                configuration_descriptor[3],
+            ])) != configuration_descriptor.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid USB configuration descriptor",
+            ));
+        }
+        Ok(UsbPersonality {
+            schema: PERSONALITY_SCHEMA,
+            max_speed: self.max_speed,
+            device_descriptor,
+            configuration_descriptor,
+            strings: self.strings,
+            microsoft_os_1: self.microsoft_os_1,
+            webusb: self.webusb,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StringDescriptor {
@@ -243,6 +340,436 @@ pub struct WebUsb {
     pub landing_page: String,
 }
 
+#[repr(C)]
+pub struct UgspBytes {
+    pub data: *const u8,
+    pub length: usize,
+}
+
+#[repr(C)]
+pub struct UgspUsbDevice {
+    pub usb_version: u16,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub device_version: u16,
+    pub device_class: u8,
+    pub device_subclass: u8,
+    pub device_protocol: u8,
+    pub max_packet_size_0: u8,
+    pub manufacturer: *const c_char,
+    pub product: *const c_char,
+    pub serial_number: *const c_char,
+    pub interface_name: *const c_char,
+}
+
+#[repr(C)]
+pub struct UgspUsbInterface {
+    pub number: u8,
+    pub class_code: u8,
+    pub subclass: u8,
+    pub protocol: u8,
+    pub string_index: u8,
+    pub endpoint_in: u8,
+    pub endpoint_out: u8,
+    pub transfer_type: u8,
+    pub max_packet_size: u16,
+    pub interval: u8,
+    pub class_descriptors: UgspBytes,
+}
+
+#[derive(Clone, Debug)]
+struct NativeDevice {
+    usb_version: u16,
+    vendor_id: u16,
+    product_id: u16,
+    device_version: u16,
+    device_class: u8,
+    device_subclass: u8,
+    device_protocol: u8,
+    max_packet_size_0: u8,
+    manufacturer: String,
+    product: String,
+    serial_number: String,
+    interface_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct NativeInterface {
+    number: u8,
+    class_code: u8,
+    subclass: u8,
+    protocol: u8,
+    string_index: u8,
+    endpoint_in: u8,
+    endpoint_out: u8,
+    transfer_type: u8,
+    max_packet_size: u16,
+    interval: u8,
+    class_descriptors: Vec<u8>,
+}
+
+/// Opaque C handle which feeds native platform configuration into the same
+/// UsbPersonalityBuilder used by descriptor discovery.
+pub struct UgspPersonalityBuilder {
+    max_speed: UsbSpeed,
+    device: NativeDevice,
+    interfaces: Vec<NativeInterface>,
+    microsoft_os_1: Option<MicrosoftOs10>,
+    webusb: Option<WebUsb>,
+}
+
+unsafe fn ffi_bytes(value: &UgspBytes) -> io::Result<Vec<u8>> {
+    if value.length != 0 && value.data.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "null byte slice",
+        ));
+    }
+    Ok(if value.length == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(value.data, value.length) }.to_vec()
+    })
+}
+
+unsafe fn ffi_string(value: *const c_char) -> io::Result<String> {
+    if value.is_null() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "null string"));
+    }
+    unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 string"))
+}
+
+fn ffi_speed(speed: u8) -> io::Result<UsbSpeed> {
+    match speed {
+        0 => Ok(UsbSpeed::LowSpeed),
+        1 => Ok(UsbSpeed::FullSpeed),
+        2 => Ok(UsbSpeed::HighSpeed),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid USB speed",
+        )),
+    }
+}
+
+fn string_descriptor(index: u8, language_id: u16, value: &str) -> io::Result<StringDescriptor> {
+    let mut descriptor = Vec::with_capacity(2 + value.len() * 2);
+    descriptor.extend_from_slice(&[0, 3]);
+    for word in value.encode_utf16() {
+        descriptor.extend_from_slice(&word.to_le_bytes());
+    }
+    if descriptor.len() > u8::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "USB string descriptor is too long",
+        ));
+    }
+    descriptor[0] = descriptor.len() as u8;
+    Ok(StringDescriptor::new(index, language_id, descriptor))
+}
+
+impl UgspPersonalityBuilder {
+    fn personality(&self) -> io::Result<UsbPersonality> {
+        if self.interfaces.is_empty() || self.interfaces.len() > u8::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "USB personality has no interfaces",
+            ));
+        }
+        let mut device = vec![
+            18,
+            1,
+            0,
+            0,
+            self.device.device_class,
+            self.device.device_subclass,
+            self.device.device_protocol,
+            self.device.max_packet_size_0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            2,
+            3,
+            1,
+        ];
+        device[2..4].copy_from_slice(&self.device.usb_version.to_le_bytes());
+        device[8..10].copy_from_slice(&self.device.vendor_id.to_le_bytes());
+        device[10..12].copy_from_slice(&self.device.product_id.to_le_bytes());
+        device[12..14].copy_from_slice(&self.device.device_version.to_le_bytes());
+
+        let mut interfaces = self.interfaces.clone();
+        interfaces.sort_by_key(|interface| interface.number);
+        for pair in interfaces.windows(2) {
+            if pair[0].number == pair[1].number {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate USB interface number",
+                ));
+            }
+        }
+        let mut configuration = vec![9, 2, 0, 0, interfaces.len() as u8, 1, 0, 0x80, 0x32];
+        for interface in &interfaces {
+            if interface.endpoint_in & 0x80 == 0
+                || interface.endpoint_out & 0x80 != 0
+                || interface.max_packet_size == 0
+                || interface.transfer_type > 3
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid native USB interface",
+                ));
+            }
+            configuration.extend_from_slice(&[
+                9,
+                4,
+                interface.number,
+                0,
+                2,
+                interface.class_code,
+                interface.subclass,
+                interface.protocol,
+                interface.string_index,
+            ]);
+            configuration.extend_from_slice(&interface.class_descriptors);
+            for address in [interface.endpoint_in, interface.endpoint_out] {
+                configuration.extend_from_slice(&[
+                    7,
+                    5,
+                    address,
+                    interface.transfer_type,
+                    self::low_byte(interface.max_packet_size),
+                    self::high_byte(interface.max_packet_size),
+                    interface.interval,
+                ]);
+            }
+        }
+        let total_length = u16::try_from(configuration.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "USB configuration descriptor is too large",
+            )
+        })?;
+        configuration[2..4].copy_from_slice(&total_length.to_le_bytes());
+
+        let mut builder = UsbPersonalityBuilder::new(self.max_speed);
+        builder
+            .device_descriptor(device)
+            .configuration_descriptor(configuration)
+            .string_descriptor(StringDescriptor::new(0, 0, vec![4, 3, 0x09, 0x04]))
+            .string_descriptor(string_descriptor(1, 0x0409, &self.device.manufacturer)?)
+            .string_descriptor(string_descriptor(2, 0x0409, &self.device.product)?)
+            .string_descriptor(string_descriptor(3, 0x0409, &self.device.serial_number)?)
+            .string_descriptor(string_descriptor(4, 0x0409, &self.device.interface_name)?);
+        if let Some(microsoft) = self.microsoft_os_1.clone() {
+            builder.microsoft_os_1(microsoft);
+        }
+        if let Some(webusb) = self.webusb.clone() {
+            builder.webusb(webusb);
+        }
+        builder.finish()
+    }
+}
+
+const fn low_byte(value: u16) -> u8 {
+    value as u8
+}
+
+const fn high_byte(value: u16) -> u8 {
+    (value >> 8) as u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ugsp_personality_builder_new(
+    speed: u8,
+    device: *const UgspUsbDevice,
+) -> *mut UgspPersonalityBuilder {
+    let result = catch_unwind(AssertUnwindSafe(
+        || -> io::Result<UgspPersonalityBuilder> {
+            let device = unsafe { device.as_ref() }
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "null USB device"))?;
+            Ok(UgspPersonalityBuilder {
+                max_speed: ffi_speed(speed)?,
+                device: NativeDevice {
+                    usb_version: device.usb_version,
+                    vendor_id: device.vendor_id,
+                    product_id: device.product_id,
+                    device_version: device.device_version,
+                    device_class: device.device_class,
+                    device_subclass: device.device_subclass,
+                    device_protocol: device.device_protocol,
+                    max_packet_size_0: device.max_packet_size_0,
+                    manufacturer: unsafe { ffi_string(device.manufacturer)? },
+                    product: unsafe { ffi_string(device.product)? },
+                    serial_number: unsafe { ffi_string(device.serial_number)? },
+                    interface_name: unsafe { ffi_string(device.interface_name)? },
+                },
+                interfaces: Vec::new(),
+                microsoft_os_1: None,
+                webusb: None,
+            })
+        },
+    ));
+    match result {
+        Ok(Ok(builder)) => Box::into_raw(Box::new(builder)),
+        _ => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ugsp_personality_builder_add_interface(
+    builder: *mut UgspPersonalityBuilder,
+    interface: *const UgspUsbInterface,
+) -> bool {
+    let result = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
+        let builder = unsafe { builder.as_mut() }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "null builder"))?;
+        let interface = unsafe { interface.as_ref() }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "null interface"))?;
+        if builder
+            .interfaces
+            .iter()
+            .any(|existing| existing.number == interface.number)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duplicate USB interface",
+            ));
+        }
+        builder.interfaces.push(NativeInterface {
+            number: interface.number,
+            class_code: interface.class_code,
+            subclass: interface.subclass,
+            protocol: interface.protocol,
+            string_index: interface.string_index,
+            endpoint_in: interface.endpoint_in,
+            endpoint_out: interface.endpoint_out,
+            transfer_type: interface.transfer_type,
+            max_packet_size: interface.max_packet_size,
+            interval: interface.interval,
+            class_descriptors: unsafe { ffi_bytes(&interface.class_descriptors)? },
+        });
+        Ok(())
+    }));
+    matches!(result, Ok(Ok(())))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ugsp_personality_builder_set_serial_number(
+    builder: *mut UgspPersonalityBuilder,
+    serial_number: *const c_char,
+) -> bool {
+    let result = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
+        let builder = unsafe { builder.as_mut() }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "null builder"))?;
+        builder.device.serial_number = unsafe { ffi_string(serial_number)? };
+        Ok(())
+    }));
+    matches!(result, Ok(Ok(())))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ugsp_personality_builder_add_microsoft_compatible_id(
+    builder: *mut UgspPersonalityBuilder,
+    vendor_code: u8,
+    interface: u8,
+    compatible_id: *const c_char,
+    sub_compatible_id: *const c_char,
+) -> bool {
+    let result = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
+        let builder = unsafe { builder.as_mut() }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "null builder"))?;
+        if vendor_code == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero Microsoft OS vendor code",
+            ));
+        }
+        let microsoft = builder
+            .microsoft_os_1
+            .get_or_insert_with(|| MicrosoftOs10::new(vendor_code));
+        if microsoft.vendor_code != vendor_code {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "conflicting Microsoft OS vendor codes",
+            ));
+        }
+        microsoft.compatible_ids.push(MicrosoftCompatibleId::new(
+            interface,
+            unsafe { ffi_string(compatible_id)? },
+            unsafe { ffi_string(sub_compatible_id)? },
+        ));
+        Ok(())
+    }));
+    matches!(result, Ok(Ok(())))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ugsp_personality_builder_set_webusb(
+    builder: *mut UgspPersonalityBuilder,
+    enabled: u8,
+    version: u16,
+    vendor_code: u8,
+    landing_page: *const c_char,
+) -> bool {
+    let result = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
+        let builder = unsafe { builder.as_mut() }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "null builder"))?;
+        builder.webusb = if enabled == 0 {
+            None
+        } else {
+            Some(WebUsb::new(version, vendor_code, unsafe {
+                ffi_string(landing_page)?
+            }))
+        };
+        Ok(())
+    }));
+    matches!(result, Ok(Ok(())))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ugsp_personality_builder_finish(
+    builder: *const UgspPersonalityBuilder,
+    output: *mut *mut u8,
+    output_length: *mut usize,
+) -> bool {
+    if output.is_null() || output_length.is_null() {
+        return false;
+    }
+    unsafe {
+        *output = ptr::null_mut();
+        *output_length = 0;
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| -> io::Result<Vec<u8>> {
+        let builder = unsafe { builder.as_ref() }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "null builder"))?;
+        builder.personality()?.to_cbor()
+    }));
+    let Ok(Ok(encoded)) = result else {
+        return false;
+    };
+    let bytes = encoded.into_boxed_slice();
+    let length = bytes.len();
+    let raw = Box::into_raw(bytes).cast::<u8>();
+    unsafe {
+        *output = raw;
+        *output_length = length;
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ugsp_personality_builder_free(builder: *mut UgspPersonalityBuilder) {
+    if !builder.is_null() {
+        drop(unsafe { Box::from_raw(builder) });
+    }
+}
+
 impl WebUsb {
     pub fn new(version: u16, vendor_code: u8, landing_page: impl Into<String>) -> Self {
         Self {
@@ -277,5 +804,60 @@ mod tests {
             UsbBusEvent::decode(&event).unwrap(),
             (UsbBusEvent::Enable, 0x0102_0304_0506_0708)
         );
+    }
+
+    #[test]
+    fn native_builder_ffi_encodes_typed_personality() {
+        use std::ffi::CString;
+
+        let manufacturer = CString::new("Trezor Company").unwrap();
+        let product = CString::new("Trezor Safe 3").unwrap();
+        let serial = CString::new("serial").unwrap();
+        let interface_name = CString::new("TREZOR Interface").unwrap();
+        let device = UgspUsbDevice {
+            usb_version: 0x0210,
+            vendor_id: 0x1209,
+            product_id: 0x53c1,
+            device_version: 0x0200,
+            device_class: 0,
+            device_subclass: 0,
+            device_protocol: 0,
+            max_packet_size_0: 64,
+            manufacturer: manufacturer.as_ptr(),
+            product: product.as_ptr(),
+            serial_number: serial.as_ptr(),
+            interface_name: interface_name.as_ptr(),
+        };
+        let interface = UgspUsbInterface {
+            number: 0,
+            class_code: 0xff,
+            subclass: 0,
+            protocol: 0,
+            string_index: 4,
+            endpoint_in: 0x81,
+            endpoint_out: 0x01,
+            transfer_type: 3,
+            max_packet_size: 64,
+            interval: 1,
+            class_descriptors: UgspBytes {
+                data: ptr::null(),
+                length: 0,
+            },
+        };
+        let builder = unsafe { ugsp_personality_builder_new(1, &device) };
+        assert!(!builder.is_null());
+        assert!(unsafe { ugsp_personality_builder_add_interface(builder, &interface) });
+        let mut output = ptr::null_mut();
+        let mut output_length = 0;
+        assert!(unsafe {
+            ugsp_personality_builder_finish(builder, &mut output, &mut output_length)
+        });
+        let encoded = unsafe { slice::from_raw_parts(output, output_length) };
+        let decoded = UsbPersonality::from_cbor(encoded).unwrap();
+        assert_eq!(&decoded.device_descriptor[8..12], &[0x09, 0x12, 0xc1, 0x53]);
+        assert_eq!(decoded.configuration_descriptor[4], 1);
+        assert_eq!(decoded.strings[2].descriptor[2], b'T');
+        unsafe { crate::discovery::ugsp_personality_cbor_free(output, output_length) };
+        unsafe { ugsp_personality_builder_free(builder) };
     }
 }
