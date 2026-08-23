@@ -1,6 +1,6 @@
 use crate::{
     MicrosoftCompatibleId, MicrosoftOs10, MicrosoftRegistryProperty, StringDescriptor,
-    UsbPersonality, UsbSpeed, WebUsb,
+    UsbPersonality, UsbPersonalityBuilder, UsbSpeed, WebUsb,
 };
 use std::collections::BTreeSet;
 use std::ffi::c_void;
@@ -131,15 +131,20 @@ where
 
     let microsoft_os_1 = discover_microsoft(&mut transfer, &mut strings, &interfaces)?;
     let webusb = discover_webusb(&mut transfer, le_u16(&device, 2)?)?;
-    Ok(UsbPersonality {
-        schema: crate::PERSONALITY_SCHEMA,
-        max_speed: speed,
-        device_descriptor: device,
-        configuration_descriptor: configuration,
-        strings,
-        microsoft_os_1,
-        webusb,
-    })
+    let mut builder = UsbPersonalityBuilder::new(speed);
+    builder
+        .device_descriptor(device)
+        .configuration_descriptor(configuration);
+    for string in strings {
+        builder.string_descriptor(string);
+    }
+    if let Some(microsoft_os_1) = microsoft_os_1 {
+        builder.microsoft_os_1(microsoft_os_1);
+    }
+    if let Some(webusb) = webusb {
+        builder.webusb(webusb);
+    }
+    builder.finish()
 }
 
 fn discover_string<F>(
