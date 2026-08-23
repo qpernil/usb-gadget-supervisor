@@ -52,7 +52,7 @@ control/lifecycle events but stays out of the packet path. Typed Microsoft OS
 | Project | Responsibility |
 | --- | --- |
 | `usb-gadget-supervisor` | CBOR USB schema/discovery helper, ConfigFS, FunctionFS, UDC ownership, privilege dropping, bind/unbind/reconfiguration, cleanup |
-| [`virtual-yubikey`](https://github.com/qpernil/virtual-yubikey) | Future native YubiKey personality publisher, FIDO, CCID, Management, PIV, FIDO2, state |
+| [`virtual-yubikey`](https://github.com/qpernil/virtual-yubikey) | Native YubiKey personality publisher, FIDO HID, CCID, Management, PIV, FIDO2, display, touch, and state |
 | `virtual-trezor` | Upstream firmware build and descriptor discovery, Pi HAL, OLED/buttons, state |
 | `virtual-yubihsm` | YubiHSM protocol, sessions, objects, capabilities, audit, state |
 
@@ -70,6 +70,8 @@ control/lifecycle events but stays out of the packet path. Typed Microsoft OS
 - Invalid replacement USB configuration is rejected before the serving
   generation is disturbed.
 - A worker crash causes UDC unbind before teardown and process restart.
+- Every replacement keeps the UDC detached for at least 250 ms before rebind;
+  initial attachment has no artificial delay.
 - `systemctl reload` requests the same clean incarnation rebuild without
   restarting the supervisor process.
 - The supervisor does not pretend that one UDC can expose multiple independent
@@ -143,14 +145,20 @@ copies.
 For example, after cloning and building `virtual-trezor`, its installation is:
 
 ```sh
+cp profiles/virtual-trezor.toml /tmp/virtual-trezor.toml
+editor /tmp/virtual-trezor.toml
 sudo install -o root -g root -m 0644 \
-  profiles/virtual-trezor.toml \
+  /tmp/virtual-trezor.toml \
   /opt/usb-gadget-supervisor/profiles/virtual-trezor.toml
+sudo /opt/usb-gadget-supervisor/usb-gadget-supervisor --check-profile \
+  --profile /opt/usb-gadget-supervisor/profiles/virtual-trezor.toml
 sudo systemctl enable --now \
   usb-gadget-supervisor@virtual-trezor.service
 ```
 
-The profile points directly to the worker in that clone's build directory.
+Set the temporary profile's `worker.command` and `worker.run_as` for that host;
+keep machine-local paths out of the checked-in neutral template. The installed
+profile points directly to the worker in that clone's build directory.
 Updating the worker is therefore `git pull`, rebuild, and restart. Only profile
 changes require reinstalling the profile. Since one UDC can expose only one
 identity, stop the currently active profile before starting another one.
@@ -197,12 +205,13 @@ stay entirely inside the device worker. See the
 
 ## Status
 
-The supervisor and Virtual Trezor implement the version-1 generation protocol.
-The legacy firmware answers real control requests through the shared discovery
-parser; the resulting CBOR personality drives ConfigFS and FunctionFS. Virtual
-YubiKey has not yet been migrated to this intentionally incompatible protocol.
-Unit tests and Raspberry Pi-targeted Rust type checks pass; run the hardware
-checklist before treating a profile as deployable.
+The supervisor, Virtual Trezor, and Virtual YubiKey implement the version-1
+generation protocol. Trezor's legacy firmware answers real control requests
+through the shared discovery parser; Virtual YubiKey constructs the same typed
+object natively. Their resulting CBOR personalities drive ConfigFS and
+FunctionFS, and both workers use transferred endpoint files directly. Unit
+tests and Raspberry Pi hardware validation pass; run the checklist for each
+new profile or target kernel before treating it as deployable.
 
 ## Contributing
 

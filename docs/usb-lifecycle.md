@@ -79,4 +79,13 @@ only when the worker publishes a new personality (including
 starts a new worker. Generation replacement unbinds the UDC so blocked endpoint
 calls are released, asks the worker to quiesce, closes the old FunctionFS
 files, and then creates an entirely new ConfigFS/FunctionFS projection and
-endpoint set.
+endpoint set. Before binding that replacement, the supervisor waits until the
+UDC has been detached for at least 250 ms. This single rule covers
+worker-requested reconfiguration, SIGHUP, and fault recovery; initial
+attachment is immediate because it has no preceding detach.
+
+The replacement may advertise the same VID, PID, serial, and descriptors, but
+it is a new host attachment with new interface and endpoint objects. Handles
+opened against the detached generation are stale and must fail; host software
+must discover and open the replacement device. The dwell makes that detach
+reliably observable—it does not manufacture a different USB identity.

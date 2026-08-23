@@ -32,7 +32,7 @@ mount | grep ffs-virtual-yubikey
 With a data-capable cable attached, the selected UDC should reach
 `configured`. For Virtual YubiKey, confirm full-speed `1050:0406`, product
 `Virtual Yubico YubiKey FIDO+CCID`, no USB serial string, FIDO HID as
-interface 0, and CCID as interface 1 after that worker has been migrated.
+interface 0, and CCID as interface 1.
 Capture `lsusb -v` and verify the device, configuration, interface, endpoint,
 CCID, and HID descriptors against the worker's accepted CBOR personality in
 `/run/usb-gadget-supervisor`.
@@ -67,6 +67,8 @@ Also verify:
 
 - a valid worker reconfiguration quiesces the old endpoint generation,
   re-enumerates, and leaves the worker process alive;
+- every replacement remains detached for at least 250 ms before the next UDC
+  bind, while initial service startup has no artificial dwell;
 - an invalid CBOR replacement receives `ConfigurationRejected` while the
   current USB generation continues serving;
 - firmware `usbReconnect()` uses the live-worker reconfiguration path;
