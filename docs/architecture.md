@@ -109,13 +109,17 @@ Serving
        |
        +-- invalid --> reject; generation continues serving
        |
-       +-- valid --> Quiesce -> unbind/remove -> build N+1 -> bind
+       +-- valid --> unbind -> Quiesce/remove -> build N+1 -> dwell -> bind
 ```
 
 The worker survives a valid USB reconfiguration. It closes the old generation
 only after `Quiesce` and receives new FDs after the supervisor has rebuilt the
 kernel objects. This is the software equivalent of firmware-driven disconnect,
 personality change, and host re-enumeration.
+Every replacement waits until the UDC has been detached for at least 250 ms
+before binding the next generation. Initial attachment has no artificial
+delay. The common bind boundary enforces this for live reconfiguration,
+SIGHUP, and worker recovery without stacking path-specific sleeps.
 
 A worker process remains the broader fault-reset boundary. Worker exit or
 control-socket EOF tears down USB and starts a fresh process whose protocol
