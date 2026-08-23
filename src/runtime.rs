@@ -27,6 +27,7 @@ const CONFIGFS: &str = "/sys/kernel/config";
 const GADGET_ROOT: &str = "/sys/kernel/config/usb_gadget";
 const LOCK_FILE: &str = "/run/lock/usb-gadget-supervisor.lock";
 const DEBUG_BUNDLE_ROOT: &str = "/run/usb-gadget-supervisor";
+const USB_RECONNECT_DWELL: Duration = Duration::from_millis(250);
 
 struct WorkerIdentity {
     name: String,
@@ -56,6 +57,7 @@ pub(crate) struct Runtime {
     udc: String,
     generation: u32,
     next_control_request: u32,
+    detached_at: Option<Instant>,
     cleaned: bool,
 }
 
@@ -93,6 +95,7 @@ impl Runtime {
             udc,
             generation: 0,
             next_control_request: 1,
+            detached_at: None,
             cleaned: false,
         };
         runtime.cleanup_stale_state()?;
@@ -345,12 +348,14 @@ impl Runtime {
             &Record::new(Kind::UsbEndpoints, self.generation, request_id, body),
             &files,
         )?;
+        drop(files);
         expect_record(
             self.control.as_ref().unwrap(),
             Kind::Serving,
             self.generation,
             request_id,
         )?;
+        self.wait_for_reconnect_dwell();
         write_attribute(&self.gadget.join("UDC"), &self.udc)?;
         println!(
             "USB gadget {} attached as {:04x}:{:04x}; generation {} has {} endpoints",
@@ -360,7 +365,6 @@ impl Runtime {
             self.generation,
             personality.endpoints.len()
         );
-        drop(files);
         self.control.as_ref().unwrap().set_read_timeout(None)?;
         self.persist_bundle(&declaration.body)?;
         Ok(())
@@ -588,7 +592,6 @@ impl Runtime {
         stop_worker(&mut self.worker)?;
         self.stop_usb_generation()?;
         self.generation = 0;
-        thread::sleep(Duration::from_millis(250));
         self.start_worker()?;
         let configuration = protocol::receive(self.control.as_ref().unwrap())?;
         self.configure(configuration, true)
@@ -788,15 +791,28 @@ impl Runtime {
         })
     }
 
-    fn unbind(&self) -> io::Result<()> {
+    fn unbind(&mut self) -> io::Result<()> {
         let path = self.gadget.join("UDC");
         if !path.exists() {
             return Ok(());
         }
         match fs::write(&path, "\n") {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.detached_at = Some(Instant::now());
+                Ok(())
+            }
             Err(error) if error.raw_os_error() == Some(libc::ENODEV) => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    fn wait_for_reconnect_dwell(&mut self) {
+        let Some(detached_at) = self.detached_at.take() else {
+            return;
+        };
+        let remaining = USB_RECONNECT_DWELL.saturating_sub(detached_at.elapsed());
+        if !remaining.is_zero() {
+            thread::sleep(remaining);
         }
     }
 

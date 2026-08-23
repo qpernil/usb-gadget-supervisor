@@ -165,12 +165,16 @@ For `usbReconnect()` or a personality change, the same worker sends another
 complete `Configure`. After validating it, the supervisor unbinds, requests
 `Quiesce`, removes the old generation, builds the next generation, sends new
 endpoint FDs, waits for `Serving`, and rebinds. The host sees a physical-style
-disconnect and full re-enumeration while firmware state survives.
+disconnect and full re-enumeration while firmware state survives. Every
+replacement path keeps the UDC detached for at least 250 ms before rebind;
+initial attachment has no artificial delay.
 
 `SIGHUP` deliberately has the broader meaning: re-read the root-owned profile,
 unbind and quiesce the current generation, close the control channel, fully
 reap the worker before unmounting FunctionFS, and start a fresh worker. Worker
 exit or control-channel EOF takes the same fresh-incarnation recovery path.
+These paths use the same common 250 ms detached interval rather than adding a
+separate worker-restart sleep.
 For an intentional replacement or service stop, the supervisor closes its
 control-channel endpoint and waits for the worker's normal EOF-driven exit.
 `SIGTERM` and then `SIGKILL` are bounded fallbacks only for a wedged worker.
