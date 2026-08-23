@@ -43,8 +43,8 @@ typed configuration at startup and may publish a replacement later.
 
 ## Worker-side USB description
 
-The shared Rust crate defines `UsbPersonality`, Serde CBOR encoding, and a
-generic discovery parser:
+The shared Rust crate defines `UsbPersonality`, one
+`UsbPersonalityBuilder`, Serde CBOR encoding, and a generic discovery parser:
 
 ```text
 discover(max_speed, control_transfer_callback) -> UsbPersonality
@@ -52,18 +52,23 @@ discover(max_speed, control_transfer_callback) -> UsbPersonality
 
 The parser directly performs the discovery a USB stack needs: device,
 configuration, language and string descriptors, plus recognized Microsoft OS
-1.0 and WebUSB capabilities. Its result is a semantic configuration object,
+1.0 and WebUSB capabilities. It feeds every discovered result into the same
+builder used by native workers. Its result is a semantic configuration object,
 not a list of cached setup-packet responses.
 
-This supports three worker shapes without changing the supervisor:
+The two construction paths are therefore:
 
-- a Rust worker constructs and serializes the typed object;
-- a static native worker embeds a known CBOR blob; or
-- a firmware emulator adapts its virtual EP0/control engine to the discovery
-  callback and lets genuine firmware answer descriptor requests.
+- `discover(control_transfer_callback) -> UsbPersonality`, where genuine
+  firmware answers the descriptor requests; and
+- incremental native construction, where device and interface configuration
+  calls populate `UsbPersonalityBuilder` before `finish()`.
 
-The C ABI exposes only the discovery call and its result deallocator. CBOR
-construction and parsing remain in Rust.
+The C ABI exposes an opaque Rust-owned builder for the second path. A static C
+worker can populate it from constant data; it does not need a second C
+personality model or a bespoke one-shot descriptor-bundle format. Both paths
+share builder validation and CBOR serialization. The schema is the internal
+protocol contract; the project does not promise byte-for-byte deterministic
+CBOR for embedded blobs.
 
 ## Supervisor projection
 
@@ -90,10 +95,10 @@ Start worker
        |
        v
 Await Configure(0, request)
-  decode and validate CBOR
        |
-       v
-Build generation 1
+       +-- empty --> ready without USB -> await nonempty Configure
+       |
+       +-- nonempty --> decode and validate CBOR -> Build generation 1
   create ConfigFS + FunctionFS
   publish descriptors
   open FunctionFS data endpoints
@@ -105,11 +110,13 @@ Await Serving(1, request)
        |
        v
 Serving
-  worker may send replacement Configure
+  worker may send a replacement or empty Configure
        |
        +-- invalid --> reject; generation continues serving
        |
        +-- valid --> unbind -> Quiesce/remove -> build N+1 -> dwell -> bind
+       |
+       +-- empty --> unbind -> Quiesce/remove -> await nonempty Configure
 ```
 
 The worker survives a valid USB reconfiguration. It closes the old generation

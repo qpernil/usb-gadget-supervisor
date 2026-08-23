@@ -72,6 +72,10 @@ control/lifecycle events but stays out of the packet path. Typed Microsoft OS
 - A worker crash causes UDC unbind before teardown and process restart.
 - Every replacement keeps the UDC detached for at least 250 ms before rebind;
   initial attachment has no artificial delay.
+- An empty worker configuration explicitly removes the USB generation and
+  remains detached until that worker publishes a nonempty personality.
+- An initial empty configuration declares a healthy, intentionally absent USB
+  device and lets the worker publish generation one later.
 - `systemctl reload` requests the same clean incarnation rebuild without
   restarting the supervisor process.
 - The supervisor does not pretend that one UDC can expose multiple independent

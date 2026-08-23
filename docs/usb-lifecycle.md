@@ -84,6 +84,12 @@ UDC has been detached for at least 250 ms. This single rule covers
 worker-requested reconfiguration, SIGHUP, and fault recovery; initial
 attachment is immediate because it has no preceding detach.
 
+An empty worker `Configure` splits that operation at the detached boundary.
+The supervisor removes the current generation after quiescence and waits with
+no FunctionFS generation until the same worker supplies a nonempty
+personality. That later configuration binds immediately: the worker-controlled
+interval replaces, rather than stacks with, the fixed replacement dwell.
+
 The replacement may advertise the same VID, PID, serial, and descriptors, but
 it is a new host attachment with new interface and endpoint objects. Handles
 opened against the detached generation are stale and must fail; host software

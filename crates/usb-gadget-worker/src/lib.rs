@@ -585,6 +585,13 @@ const fn high_byte(value: u16) -> u8 {
 }
 
 #[no_mangle]
+/// Creates a native USB personality builder.
+///
+/// # Safety
+///
+/// `device` must point to a readable `UgspUsbDevice`. Every string pointer in
+/// that structure must name a valid NUL-terminated C string for the duration
+/// of this call.
 pub unsafe extern "C" fn ugsp_personality_builder_new(
     speed: u8,
     device: *const UgspUsbDevice,
@@ -622,6 +629,14 @@ pub unsafe extern "C" fn ugsp_personality_builder_new(
 }
 
 #[no_mangle]
+/// Adds an interface to a native USB personality builder.
+///
+/// # Safety
+///
+/// `builder` must be a live pointer returned by
+/// `ugsp_personality_builder_new`. `interface` must point to a readable
+/// `UgspUsbInterface`; its class-descriptor pointer must be readable for its
+/// declared length for the duration of this call.
 pub unsafe extern "C" fn ugsp_personality_builder_add_interface(
     builder: *mut UgspPersonalityBuilder,
     interface: *const UgspUsbInterface,
@@ -660,6 +675,13 @@ pub unsafe extern "C" fn ugsp_personality_builder_add_interface(
 }
 
 #[no_mangle]
+/// Replaces the builder's serial number.
+///
+/// # Safety
+///
+/// `builder` must be a live pointer returned by
+/// `ugsp_personality_builder_new`, and `serial_number` must name a valid
+/// NUL-terminated C string for the duration of this call.
 pub unsafe extern "C" fn ugsp_personality_builder_set_serial_number(
     builder: *mut UgspPersonalityBuilder,
     serial_number: *const c_char,
@@ -674,6 +696,13 @@ pub unsafe extern "C" fn ugsp_personality_builder_set_serial_number(
 }
 
 #[no_mangle]
+/// Adds a Microsoft OS 1.0 compatible-ID declaration.
+///
+/// # Safety
+///
+/// `builder` must be a live pointer returned by
+/// `ugsp_personality_builder_new`. Both string pointers must name valid
+/// NUL-terminated C strings for the duration of this call.
 pub unsafe extern "C" fn ugsp_personality_builder_add_microsoft_compatible_id(
     builder: *mut UgspPersonalityBuilder,
     vendor_code: u8,
@@ -710,6 +739,13 @@ pub unsafe extern "C" fn ugsp_personality_builder_add_microsoft_compatible_id(
 }
 
 #[no_mangle]
+/// Sets or clears the builder's WebUSB platform capability.
+///
+/// # Safety
+///
+/// `builder` must be a live pointer returned by
+/// `ugsp_personality_builder_new`, and `landing_page` must name a valid
+/// NUL-terminated C string for the duration of this call.
 pub unsafe extern "C" fn ugsp_personality_builder_set_webusb(
     builder: *mut UgspPersonalityBuilder,
     enabled: u8,
@@ -733,6 +769,14 @@ pub unsafe extern "C" fn ugsp_personality_builder_set_webusb(
 }
 
 #[no_mangle]
+/// Validates and serializes a native USB personality builder.
+///
+/// # Safety
+///
+/// `builder` must be a live pointer returned by
+/// `ugsp_personality_builder_new`. `output` and `output_length` must be valid,
+/// writable pointers. On success, release the returned buffer with
+/// `ugsp_personality_cbor_free`.
 pub unsafe extern "C" fn ugsp_personality_builder_finish(
     builder: *const UgspPersonalityBuilder,
     output: *mut *mut u8,
@@ -764,6 +808,12 @@ pub unsafe extern "C" fn ugsp_personality_builder_finish(
 }
 
 #[no_mangle]
+/// Releases a native USB personality builder.
+///
+/// # Safety
+///
+/// `builder` must be null or a live pointer returned by
+/// `ugsp_personality_builder_new` that has not previously been freed.
 pub unsafe extern "C" fn ugsp_personality_builder_free(builder: *mut UgspPersonalityBuilder) {
     if !builder.is_null() {
         drop(unsafe { Box::from_raw(builder) });
