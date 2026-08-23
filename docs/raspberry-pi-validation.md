@@ -65,10 +65,16 @@ must:
 
 Also verify:
 
+- an initial empty `Configure` leaves the healthy worker running indefinitely
+  with no gadget generation, and its first nonempty `Configure` attaches
+  generation one;
 - a valid worker reconfiguration quiesces the old endpoint generation,
   re-enumerates, and leaves the worker process alive;
 - every replacement remains detached for at least 250 ms before the next UDC
   bind, while initial service startup has no artificial dwell;
+- an empty `Configure` quiesces and removes the active generation without
+  stopping the worker, remains detached indefinitely, and a later nonempty
+  `Configure` binds without adding the replacement dwell;
 - an invalid CBOR replacement receives `ConfigurationRejected` while the
   current USB generation continues serving;
 - firmware `usbReconnect()` uses the live-worker reconfiguration path;

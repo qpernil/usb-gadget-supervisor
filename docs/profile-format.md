@@ -97,11 +97,13 @@ whose body is the schema-1 CBOR `UsbPersonality`. That object contains:
 - an optional typed Microsoft OS 1.0 declaration; and
 - an optional typed WebUSB declaration.
 
-The shared `usb-gadget-worker` crate defines this object and its Serde/CBOR
-encoding. A native Rust worker can construct it directly. A static worker can
-embed a previously generated CBOR byte string. A firmware-backed worker can
-call the shared discovery parser with a control-transfer callback, which asks
-the firmware for the same descriptors a real USB stack would request.
+The shared `usb-gadget-worker` crate defines this object, its single
+`UsbPersonalityBuilder`, and its Serde/CBOR encoding. A firmware-backed worker
+can call the discovery parser with a control-transfer callback, which asks the
+firmware for the same descriptors a real USB stack would request. A native
+worker instead populates the same Rust-owned builder incrementally from its
+USB configuration calls. A static C worker can populate that builder from
+constant data without maintaining a separate serialized-bundle ABI.
 
 The supervisor decodes and logs the object, validates it, derives ConfigFS and
 FunctionFS state, and saves the exact accepted CBOR at

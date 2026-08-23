@@ -297,6 +297,33 @@ impl Runtime {
         {
             return invalid("worker returned a mismatched USB configuration");
         }
+        if declaration.body.is_empty() {
+            if self.usb.is_none() {
+                if initial {
+                    self.control.as_ref().unwrap().set_read_timeout(None)?;
+                    println!(
+                        "USB gadget {} worker is ready without a USB personality; waiting for configuration",
+                        self.profile.name
+                    );
+                    return Ok(());
+                }
+                return invalid(
+                    "worker requested USB unconfiguration without a serving generation",
+                );
+            }
+            let request_id = declaration.request_id;
+            self.unbind()?;
+            self.quiesce_worker(request_id)?;
+            self.stop_usb_generation()?;
+            // An empty personality has a worker-controlled detached lifetime.
+            // Its later nonempty Configure must not add replacement dwell.
+            self.detached_at = None;
+            println!(
+                "USB gadget {} unconfigured at generation {}; waiting for worker configuration",
+                self.profile.name, self.generation
+            );
+            return Ok(());
+        }
         let request_id = declaration.request_id;
         let (bundle, personality) = match usb_personality::discover_bundle(&declaration.body) {
             Ok(configuration) => configuration,

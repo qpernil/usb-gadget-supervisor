@@ -31,7 +31,7 @@ unknown kinds, truncated ancillary data, and mismatched FD counts fail closed.
 | supervisor → worker | `UsbControlRequest` | `0x04` | setup packet + optional OUT data |
 | supervisor → worker | `Quiesce` | `0x11` | empty |
 | supervisor → worker | `ConfigurationRejected` | `0x12` | diagnostic UTF-8 text |
-| worker → supervisor | `Configure` | `0x80` | schema-1 `UsbPersonality` CBOR |
+| worker → supervisor | `Configure` | `0x80` | schema-1 `UsbPersonality` CBOR, or empty to detach |
 | worker → supervisor | `UsbControlResponse` | `0x81` | disposition + optional IN data |
 | worker → supervisor | `Serving` | `0x82` | empty |
 | worker → supervisor | `Quiesced` | `0x84` | empty |
@@ -62,19 +62,28 @@ shared `usb-gadget-worker` crate. It represents the USB-facing configuration
 that formerly lived in the installed text profile; it is not a transcript of
 control requests.
 
-The public C surface is intentionally small:
+The public C surface offers the two construction paths:
 
 ```c
 bool ugsp_discover_usb_personality(
     uint8_t speed, ugsp_control_transfer_fn transfer, void *context,
     uint8_t **output, size_t *output_length);
 
+struct ugsp_personality_builder *ugsp_personality_builder_new(...);
+bool ugsp_personality_builder_add_interface(...);
+bool ugsp_personality_builder_finish(
+    const struct ugsp_personality_builder *builder,
+    uint8_t **output, size_t *output_length);
+
 void ugsp_personality_cbor_free(uint8_t *bytes, size_t length);
 ```
 
 Discovery issues standard, Microsoft OS, and WebUSB control transfers through
-the callback, parses the answers, and returns the final CBOR object. A native
-worker may instead construct the Rust object or retain a static CBOR blob.
+the callback and feeds the answers into `UsbPersonalityBuilder`. A native
+worker incrementally supplies the corresponding device, interface, endpoint,
+WinUSB, and WebUSB information to an opaque builder. `finish()` produces the
+same typed `UsbPersonality` and CBOR in both cases. The native builder's C
+structures are transient FFI inputs, not another wire format.
 
 ## Data endpoints
 
@@ -168,6 +177,19 @@ endpoint FDs, waits for `Serving`, and rebinds. The host sees a physical-style
 disconnect and full re-enumeration while firmware state survives. Every
 replacement path keeps the UDC detached for at least 250 ms before rebind;
 initial attachment has no artificial delay.
+
+An empty `Configure` personality deliberately separates removal from
+replacement. The supervisor unbinds, completes the same
+`Quiesce`/`Quiesced` endpoint shutdown, and removes the current generation
+without stopping the worker. It then waits indefinitely for a later nonempty
+`Configure`. That bind uses the worker-controlled ejection interval exactly;
+it does not add the 250 ms floor used by atomic replacement and restart paths.
+
+An initial empty `Configure` is also a complete readiness declaration. The
+worker process and its named resources are healthy, but it has deliberately not
+exposed a USB device. The supervisor enters its ordinary control loop and waits
+without a timeout for that worker's first nonempty `Configure`; no generation
+or FunctionFS state exists meanwhile.
 
 `SIGHUP` deliberately has the broader meaning: re-read the root-owned profile,
 unbind and quiesce the current generation, close the control channel, fully
