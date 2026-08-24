@@ -570,21 +570,47 @@ impl Runtime {
         fs::rename(temporary, path)
     }
 
-    fn quiesce_worker(&self, request_id: u32) -> io::Result<()> {
+    fn quiesce_worker(&mut self, request_id: u32) -> io::Result<()> {
         let Some(control) = self.control.as_ref() else {
             return Ok(());
         };
-        control.set_read_timeout(Some(Duration::from_millis(
-            self.profile.worker.readiness_timeout_ms,
-        )))?;
-        let result = protocol::send(
-            control,
-            &Record::new(Kind::Quiesce, self.generation, request_id, Vec::new()),
-            &[] as &[File],
-        )
-        .and_then(|_| expect_record(control, Kind::Quiesced, self.generation, request_id));
-        let timeout_result = control.set_read_timeout(None);
-        result.and(timeout_result)
+        println!(
+            "usb-gadget-supervisor: quiescing {} generation={} request={request_id}",
+            self.profile.name, self.generation
+        );
+        let result = (|| {
+            control.set_read_timeout(Some(Duration::from_millis(
+                self.profile.worker.readiness_timeout_ms,
+            )))?;
+            let result = protocol::send(
+                control,
+                &Record::new(Kind::Quiesce, self.generation, request_id, Vec::new()),
+                &[] as &[File],
+            )
+            .and_then(|_| expect_record(control, Kind::Quiesced, self.generation, request_id));
+            let timeout_result = control.set_read_timeout(None);
+            result.and(timeout_result)
+        })();
+        match result {
+            Ok(()) => {
+                println!(
+                    "usb-gadget-supervisor: quiesced {} generation={} request={request_id}",
+                    self.profile.name, self.generation
+                );
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!(
+                    "usb-gadget-supervisor: quiesce failed for {} generation={} request={request_id}: {error}; closing worker control channel",
+                    self.profile.name, self.generation
+                );
+                // Do not repeat the same readiness timeout from cleanup. Closing
+                // the channel lets a responsive worker exit; stop_worker bounds
+                // an unresponsive endpoint helper with TERM/KILL.
+                self.control = None;
+                Err(error)
+            }
+        }
     }
 
     fn stop_usb_generation(&mut self) -> io::Result<()> {
@@ -1273,6 +1299,10 @@ fn stop_worker(worker: &mut Option<Child>) -> io::Result<()> {
         thread::sleep(Duration::from_millis(20));
     }
     if child.try_wait()?.is_none() {
+        eprintln!(
+            "usb-gadget-supervisor: worker pid {} did not exit after control-channel closure; sending SIGTERM",
+            child.id()
+        );
         signal_child(&child, libc::SIGTERM)?;
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1283,6 +1313,10 @@ fn stop_worker(worker: &mut Option<Child>) -> io::Result<()> {
         thread::sleep(Duration::from_millis(20));
     }
     if child.try_wait()?.is_none() {
+        eprintln!(
+            "usb-gadget-supervisor: worker pid {} did not exit after SIGTERM; sending SIGKILL",
+            child.id()
+        );
         signal_child(&child, libc::SIGKILL)?;
     }
     child.wait().map(|_| ())

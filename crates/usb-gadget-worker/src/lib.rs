@@ -6,11 +6,67 @@ use std::io::{self, Cursor};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
+use std::sync::{Condvar, Mutex};
 
 mod discovery;
 pub use discovery::{discover, SetupPacket};
 
 pub const USB_BUS_EVENT_BODY_LENGTH: usize = 9;
+
+/// Coordinates blocking FunctionFS endpoint helpers with USB activation and
+/// worker quiescence.
+///
+/// FunctionFS cancels pending I/O when an endpoint is disabled, but a new
+/// blocking operation issued while disabled waits for the endpoint to be
+/// enabled again. Endpoint helpers therefore wait here after cancellation and
+/// only retry for a strictly newer activation. Quiescence wakes every waiter.
+#[derive(Debug, Default)]
+pub struct EndpointLifecycle {
+    state: Mutex<EndpointLifecycleState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct EndpointLifecycleState {
+    activation: u64,
+    stopping: bool,
+}
+
+impl EndpointLifecycle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn activate(&self, activation: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.stopping && activation > state.activation {
+            state.activation = activation;
+            self.changed.notify_all();
+        }
+    }
+
+    pub fn stop(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.stopping {
+            state.stopping = true;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Waits for an endpoint activation newer than `observed`.
+    ///
+    /// Returns `None` once the generation is stopping.
+    pub fn wait_for_activation_after(&self, observed: u64) -> Option<u64> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while !state.stopping && state.activation <= observed {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        (!state.stopping).then_some(state.activation)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -833,6 +889,32 @@ impl WebUsb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn endpoint_lifecycle_waits_for_new_activation_and_stops() {
+        let lifecycle = Arc::new(EndpointLifecycle::new());
+        let (sender, receiver) = mpsc::channel();
+        let waiter = {
+            let lifecycle = Arc::clone(&lifecycle);
+            thread::spawn(move || {
+                sender.send(lifecycle.wait_for_activation_after(0)).unwrap();
+                sender.send(lifecycle.wait_for_activation_after(1)).unwrap();
+            })
+        };
+
+        assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
+        lifecycle.activate(1);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some(1)
+        );
+        lifecycle.stop();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), None);
+        waiter.join().unwrap();
+    }
 
     #[test]
     fn constructors_round_trip_as_cbor_byte_strings() {

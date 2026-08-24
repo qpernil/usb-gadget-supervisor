@@ -154,6 +154,12 @@ only process that reads `ep0`.
 Suspend does not close the endpoint files or change the endpoint activation or
 USB generation. `Disable` cancels the current activation and `Enable` starts a
 fresh one using the same FunctionFS descriptors.
+FunctionFS may block a newly issued operation while an endpoint is disabled,
+so a worker endpoint helper must not immediately retry a canceled operation.
+It parks after `ENODEV`, `EPIPE`, `ESHUTDOWN`, or disabled-endpoint `EAGAIN`
+and resumes only when `Enable` reports a strictly newer
+`endpoint_activation`. A `Quiesce` request wakes parked helpers for permanent
+generation shutdown before the worker returns `Quiesced`.
 See [USB lifecycle](usb-lifecycle.md) for host sleep,
 reset, disconnect, and power-loss behavior.
 
@@ -197,6 +203,10 @@ reap the worker before unmounting FunctionFS, and start a fresh worker. Worker
 exit or control-channel EOF takes the same fresh-incarnation recovery path.
 These paths use the same common 250 ms detached interval rather than adding a
 separate worker-restart sleep.
+If a worker misses its bounded quiesce deadline, the supervisor closes the
+control channel immediately and proceeds to bounded TERM/KILL recovery. It
+does not spend a second readiness timeout repeating the same handshake during
+cleanup.
 For an intentional replacement or service stop, the supervisor closes its
 control-channel endpoint and waits for the worker's normal EOF-driven exit.
 `SIGTERM` and then `SIGKILL` are bounded fallbacks only for a wedged worker.
