@@ -84,6 +84,12 @@ UDC has been detached for at least 250 ms. This single rule covers
 worker-requested reconfiguration, SIGHUP, and fault recovery; initial
 attachment is immediate because it has no preceding detach.
 
+Endpoint helpers treat cancellation as an activation boundary, not as a timed
+retry condition. After FunctionFS releases a blocked operation they wait for
+either a newer `Enable` activation or `Quiesce`. This prevents a helper from
+entering a second blocking FunctionFS operation while the supervisor is
+waiting for `Quiesced` from that same worker.
+
 An empty worker `Configure` splits that operation at the detached boundary.
 The supervisor removes the current generation after quiescence and waits with
 no FunctionFS generation until the same worker supplies a nonempty
