@@ -59,8 +59,7 @@ contributes its line-request FD, not its GPIO-chip FD.
 
 The `Configure` body is CBOR produced from the typed `UsbPersonality` in the
 shared `usb-gadget-worker` crate. It represents the USB-facing configuration
-that formerly lived in the installed text profile; it is not a transcript of
-control requests.
+and is not a transcript of control requests.
 
 The public C surface offers the two construction paths:
 
