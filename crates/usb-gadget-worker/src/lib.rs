@@ -10,6 +10,13 @@ use std::sync::{Condvar, Mutex};
 
 mod discovery;
 pub use discovery::{discover, SetupPacket};
+#[cfg(unix)]
+mod persistence;
+#[cfg(unix)]
+pub use persistence::{
+    replace_file_atomically, MutationReceipt, PersistenceMode, StatePersistence,
+    StatePersistenceHandle,
+};
 
 pub const USB_BUS_EVENT_BODY_LENGTH: usize = 9;
 
