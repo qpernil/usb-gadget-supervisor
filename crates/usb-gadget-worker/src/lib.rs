@@ -14,7 +14,7 @@ pub use discovery::{discover, SetupPacket};
 mod persistence;
 #[cfg(unix)]
 pub use persistence::{
-    replace_file_atomically, MutationReceipt, PersistenceMode, StatePersistence,
+    replace_file_atomically, MutationReceipt, PersistenceMode, StateLock, StatePersistence,
     StatePersistenceHandle,
 };
 

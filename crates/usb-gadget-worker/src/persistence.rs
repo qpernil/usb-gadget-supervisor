@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -10,6 +11,50 @@ use std::time::{Duration, Instant};
 pub enum PersistenceMode {
     Batched(Duration),
     Immediate,
+}
+
+/// An exclusive, process-lifetime lock protecting one persistent device.
+///
+/// The lock file is deliberately separate from atomically replaced state
+/// files. Keep this value alive from before state restoration until after the
+/// final persistence flush.
+#[must_use = "the state lock must be held for the entire persistence lifetime"]
+#[derive(Debug)]
+pub struct StateLock {
+    _file: File,
+    path: PathBuf,
+}
+
+impl StateLock {
+    pub fn acquire(path: PathBuf) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| lock_error(&path, "open", error))?;
+        // SAFETY: file owns a valid descriptor for the duration of this call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(lock_error(&path, "acquire", io::Error::last_os_error()));
+        }
+        Ok(Self { _file: file, path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn lock_error(path: &Path, operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{operation} persistent state lock {}: {error}",
+            path.display()
+        ),
+    )
 }
 
 impl PersistenceMode {
@@ -381,6 +426,29 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
+
+    #[test]
+    fn state_lock_excludes_another_owner_and_survives_as_a_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "usb-gadget-worker-state-lock-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("device.lock");
+
+        let first = StateLock::acquire(path.clone()).unwrap();
+        assert_eq!(first.path(), path);
+        let error = StateLock::acquire(path.clone()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(first);
+        let second = StateLock::acquire(path.clone()).unwrap();
+        drop(second);
+        assert!(path.exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn batched_mutations_coalesce_without_extending_the_first_deadline() {
