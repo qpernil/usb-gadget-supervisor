@@ -16,7 +16,7 @@ and FunctionFS.
 The supervisor owns only the privileged mechanics of Linux USB gadget mode:
 ConfigFS, FunctionFS mounts, UDC binding, process credentials, lifecycle, and
 cleanup. Device behavior belongs to separate unprivileged workers such as
-`virtual-yubikey`, `virtual-trezor`, and a future `virtual-yubihsm`.
+`virtual-yubikey`, `virtual-trezor`, and `virtual-yubihsm`.
 
 The goal is a deliberately small privileged boundary: the supervisor performs
 the Linux operations that require root, while each device implementation stays
