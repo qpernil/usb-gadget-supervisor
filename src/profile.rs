@@ -340,9 +340,11 @@ runtime_directory = "/run/test-device"
         let invalid = format!(
             "{VALID}\n[[resources]]\ntype = \"gpio-lines\"\nname = \"display\"\npath = \"/dev/gpiochip0\"\noffsets = [24, 25]\ndirection = \"output\"\ninitial_values = [false]\n"
         );
-        assert!(toml::from_str::<Profile>(&invalid)
-            .unwrap()
-            .validate()
-            .is_err());
+        assert!(
+            toml::from_str::<Profile>(&invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 }

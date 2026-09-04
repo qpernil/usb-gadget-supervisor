@@ -5,15 +5,15 @@ use crate::profile::{
     CharacterDeviceResource, GpioBias, GpioDirection, GpioEdge, GpioLinesResource, Profile,
     ResourceAccess, ResourceProfile,
 };
-use crate::protocol::{self, Kind, Record, CONTROL_FD, RUNTIME_DIRECTORY_ENV, STATE_DIRECTORY_ENV};
+use crate::protocol::{self, CONTROL_FD, Kind, RUNTIME_DIRECTORY_ENV, Record, STATE_DIRECTORY_ENV};
 use crate::usb_personality::{self, Personality};
 use crate::{RESTART_REQUESTED, STOP_REQUESTED};
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{chown, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt, chown};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -162,7 +162,7 @@ impl Runtime {
                         return invalid(format!(
                             "unexpected asynchronous worker message {:?}",
                             record.kind
-                        ))
+                        ));
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(error) => {
@@ -425,10 +425,10 @@ impl Runtime {
                 ));
             }
             let length = length as usize;
-            if length % EVENT_LENGTH != 0 {
+            if !length.is_multiple_of(EVENT_LENGTH) {
                 return invalid("truncated FunctionFS event stream");
             }
-            for event in events[..length].chunks_exact(EVENT_LENGTH) {
+            for event in events[..length].as_chunks::<EVENT_LENGTH>().0 {
                 match event[8] {
                     0 | 1 | 2 | 3 | 5 | 6 => self.forward_bus_event(event[8])?,
                     4 => match self.forward_control_request(&event[..8]) {
@@ -1401,10 +1401,10 @@ fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 fn record_error(first: &mut Option<io::Error>, result: io::Result<()>) {
-    if let Err(error) = result {
-        if first.is_none() {
-            *first = Some(error);
-        }
+    if let Err(error) = result
+        && first.is_none()
+    {
+        *first = Some(error);
     }
 }
 fn invalid<T>(message: impl Into<String>) -> io::Result<T> {

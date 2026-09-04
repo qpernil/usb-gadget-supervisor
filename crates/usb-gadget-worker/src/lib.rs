@@ -1,21 +1,21 @@
 //! Shared worker-side model for publishing USB personalities to the supervisor.
 
 use serde::{Deserialize, Serialize};
-use std::ffi::{c_char, CStr};
+use std::ffi::{CStr, c_char};
 use std::io::{self, Cursor};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 use std::sync::{Condvar, Mutex};
 
 mod discovery;
-pub use discovery::{discover, SetupPacket};
+pub use discovery::{SetupPacket, discover};
 #[cfg(unix)]
 mod persistence;
 #[cfg(unix)]
 pub use persistence::{
-    replace_file_atomically, MutationReceipt, PersistenceMode, StateLock, StatePersistence,
-    StatePersistenceHandle,
+    MutationReceipt, PersistenceMode, StateLock, StatePersistence, StatePersistenceHandle,
+    replace_file_atomically,
 };
 
 pub const USB_BUS_EVENT_BODY_LENGTH: usize = 9;
@@ -647,7 +647,7 @@ const fn high_byte(value: u16) -> u8 {
     (value >> 8) as u8
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// Creates a native USB personality builder.
 ///
 /// # Safety
@@ -691,7 +691,7 @@ pub unsafe extern "C" fn ugsp_personality_builder_new(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// Adds an interface to a native USB personality builder.
 ///
 /// # Safety
@@ -737,7 +737,7 @@ pub unsafe extern "C" fn ugsp_personality_builder_add_interface(
     matches!(result, Ok(Ok(())))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// Replaces the builder's serial number.
 ///
 /// # Safety
@@ -758,7 +758,7 @@ pub unsafe extern "C" fn ugsp_personality_builder_set_serial_number(
     matches!(result, Ok(Ok(())))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// Adds a Microsoft OS 1.0 compatible-ID declaration.
 ///
 /// # Safety
@@ -801,7 +801,7 @@ pub unsafe extern "C" fn ugsp_personality_builder_add_microsoft_compatible_id(
     matches!(result, Ok(Ok(())))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// Sets or clears the builder's WebUSB platform capability.
 ///
 /// # Safety
@@ -831,7 +831,7 @@ pub unsafe extern "C" fn ugsp_personality_builder_set_webusb(
     matches!(result, Ok(Ok(())))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// Validates and serializes a native USB personality builder.
 ///
 /// # Safety
@@ -870,7 +870,7 @@ pub unsafe extern "C" fn ugsp_personality_builder_finish(
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// Releases a native USB personality builder.
 ///
 /// # Safety
@@ -896,7 +896,7 @@ impl WebUsb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{mpsc, Arc};
+    use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::Duration;
 

@@ -5,7 +5,7 @@ use crate::{
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::io;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
@@ -69,8 +69,10 @@ where
         return invalid("firmware returned an invalid USB language descriptor");
     }
     let language_ids = languages[2..]
-        .chunks_exact(2)
-        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|word| u16::from_le_bytes(*word))
         .collect::<BTreeSet<_>>();
     let mut strings = vec![StringDescriptor::new(0, 0, languages)];
     let mut seen_strings = BTreeSet::new();
@@ -183,8 +185,10 @@ where
         return invalid("firmware returned an invalid Microsoft OS string descriptor");
     }
     let signature = os_string[2..16]
-        .chunks_exact(2)
-        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|word| u16::from_le_bytes(*word))
         .collect::<Vec<_>>();
     if String::from_utf16(&signature).ok().as_deref() != Some("MSFT100") || os_string[16] == 0 {
         return invalid("firmware returned an unsupported Microsoft OS string descriptor");
@@ -210,7 +214,7 @@ where
         if count == 0 || 16 + count * 24 > compatible.len() {
             return invalid("firmware returned a truncated Microsoft compatible-ID descriptor");
         }
-        for section in compatible[16..16 + count * 24].chunks_exact(24) {
+        for section in compatible[16..16 + count * 24].as_chunks::<24>().0 {
             if !interfaces.contains(&section[0]) {
                 return invalid("Microsoft compatible ID names an unknown interface");
             }
@@ -398,12 +402,14 @@ fn usb_identifier(bytes: &[u8]) -> io::Result<String> {
 }
 
 fn utf16le_string(bytes: &[u8]) -> io::Result<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return invalid("Microsoft registry property name has an odd length");
     }
     let mut words = bytes
-        .chunks_exact(2)
-        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|word| u16::from_le_bytes(*word))
         .collect::<Vec<_>>();
     if words.last() == Some(&0) {
         words.pop();
@@ -457,7 +463,7 @@ pub type ControlTransferCallback = unsafe extern "C" fn(
     response_length: *mut usize,
 ) -> bool;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ugsp_discover_usb_personality(
     speed: u8,
     callback: Option<ControlTransferCallback>,
@@ -524,7 +530,7 @@ pub unsafe extern "C" fn ugsp_discover_usb_personality(
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ugsp_personality_cbor_free(bytes: *mut u8, length: usize) {
     if !bytes.is_null() {
         let slice = ptr::slice_from_raw_parts_mut(bytes, length);

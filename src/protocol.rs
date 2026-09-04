@@ -210,7 +210,7 @@ fn receive_with_flags(channel: &UnixStream, extra_flags: libc::c_int) -> io::Res
             }
             let base = libc::CMSG_LEN(0) as usize;
             let size = (*ancillary).cmsg_len as usize;
-            if size < base || (size - base) % std::mem::size_of::<libc::c_int>() != 0 {
+            if size < base || !(size - base).is_multiple_of(std::mem::size_of::<libc::c_int>()) {
                 return invalid("malformed SCM_RIGHTS payload");
             }
             let count = (size - base) / std::mem::size_of::<libc::c_int>();

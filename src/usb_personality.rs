@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use usb_gadget_worker::{
-    MicrosoftOs10 as BundleMicrosoftOs10, UsbPersonality as PersonalityBundle,
-    WebUsb as BundleWebUsb, PERSONALITY_SCHEMA,
+    MicrosoftOs10 as BundleMicrosoftOs10, PERSONALITY_SCHEMA, UsbPersonality as PersonalityBundle,
+    WebUsb as BundleWebUsb,
 };
 
 const USB_DT_DEVICE: u8 = 0x01;
@@ -228,8 +228,10 @@ fn usb_string(
         ));
     }
     let words = descriptor[2..descriptor[0] as usize]
-        .chunks_exact(2)
-        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|word| u16::from_le_bytes(*word))
         .collect::<Vec<_>>();
     String::from_utf16(&words).map_err(|_| {
         io::Error::new(
