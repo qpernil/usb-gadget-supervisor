@@ -115,7 +115,7 @@ device UI. Those concerns stay in the worker repositories.
 
 ## Build
 
-Rust 1.85 or later is required. The binary is Linux-only, while profile and
+Rust 1.94 or later is required. The binary is Linux-only, while profile and
 wire-format unit tests also run on macOS:
 
 ```sh

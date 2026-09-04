@@ -1,8 +1,8 @@
 [package]
 name = "usb-gadget-worker"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.85"
+edition = "2024"
+rust-version = "1.94"
 description = "Worker-side USB personality model for usb-gadget-supervisor"
 license = "MIT"
 publish = false

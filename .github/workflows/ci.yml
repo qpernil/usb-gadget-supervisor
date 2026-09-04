@@ -10,6 +10,9 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust components
@@ -22,3 +25,13 @@ jobs:
         run: cargo test --locked
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@1.94.0
+      - name: Check minimum supported Rust version
+        run: cargo check --locked --workspace --all-targets
