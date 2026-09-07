@@ -4,7 +4,6 @@ use std::path::PathBuf;
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Options {
     pub(crate) profile: PathBuf,
-    pub(crate) udc: Option<String>,
     pub(crate) check_profile: bool,
 }
 
@@ -13,7 +12,6 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut profile = None;
-    let mut udc = None;
     let mut check_profile = false;
     let mut arguments = arguments.into_iter();
 
@@ -25,28 +23,12 @@ where
                 })?;
                 profile = Some(PathBuf::from(value));
             }
-            "--udc" => {
-                let value = arguments.next().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "--udc needs a name")
-                })?;
-                if value.is_empty()
-                    || !value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("invalid UDC name: {value}"),
-                    ));
-                }
-                udc = Some(value);
-            }
             "--check-profile" => check_profile = true,
             "--help" | "-h" => {
                 println!(
-                    "Usage: usb-gadget-supervisor --profile PATH [--udc NAME] [--check-profile]\n\
+                    "Usage: usb-gadget-supervisor --profile NAME_OR_PATH [--check-profile]\n\
                      \n\
-                     Load one root-owned device profile, create its Linux USB gadget,\n\
+                     Load one root-owned profile, select its USB or inherited-device mode,\n\
                      and run the configured worker as an unprivileged account. Use\n\
                      --check-profile to validate the schema without touching hardware."
                 );
@@ -61,17 +43,32 @@ where
         }
     }
 
-    let profile = profile
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--profile PATH is required"))?;
-    if !profile.is_absolute() {
-        return Err(io::Error::new(
+    let profile = profile.ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the profile path must be absolute",
-        ));
-    }
+            "--profile NAME_OR_PATH is required",
+        )
+    })?;
+    let profile = if profile.is_absolute() {
+        profile
+    } else {
+        let name = profile.to_str().unwrap_or_default();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--profile needs an installed profile name or an absolute path",
+            ));
+        }
+        PathBuf::from("/opt/usb-gadget-supervisor/profiles").join(format!("{name}.toml"))
+    };
     Ok(Options {
         profile,
-        udc,
         check_profile,
     })
 }
@@ -81,26 +78,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requires_an_absolute_profile() {
-        let error = parse(["--profile".into(), "relative.toml".into()]).unwrap_err();
+    fn rejects_relative_profile_paths() {
+        let error = parse(["--profile".into(), "../relative.toml".into()]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
-    fn accepts_a_valid_udc_override() {
+    fn resolves_an_installed_profile_name() {
+        let options = parse(["--profile".into(), "virtual-yubihsm-i2c".into()]).unwrap();
         assert_eq!(
-            parse([
-                "--profile".into(),
-                "/opt/usb-gadget-supervisor/profiles/yubikey.toml".into(),
-                "--udc".into(),
-                "fe980000.usb".into(),
-            ])
-            .unwrap(),
-            Options {
-                profile: "/opt/usb-gadget-supervisor/profiles/yubikey.toml".into(),
-                udc: Some("fe980000.usb".into()),
-                check_profile: false,
-            }
+            options.profile,
+            PathBuf::from("/opt/usb-gadget-supervisor/profiles/virtual-yubihsm-i2c.toml")
         );
+    }
+
+    #[test]
+    fn rejects_launch_overrides() {
+        let error = parse([
+            "--profile".into(),
+            "virtual-yubikey".into(),
+            "--udc".into(),
+            "fe980000.usb".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

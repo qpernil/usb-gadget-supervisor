@@ -66,8 +66,10 @@ fn run() -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let signals = install_signal_handlers()?;
-        let mut runtime =
-            runtime::Runtime::setup(options.profile, profile, options.udc.as_deref())?;
+        if profile.mode == profile::Mode::Device {
+            return runtime::run_device(options.profile, profile, signals.read_fd());
+        }
+        let mut runtime = runtime::Runtime::setup(options.profile, profile)?;
         let serve_result = runtime.serve(signals.read_fd());
         let cleanup_result = runtime.cleanup();
         serve_result.and(cleanup_result)
