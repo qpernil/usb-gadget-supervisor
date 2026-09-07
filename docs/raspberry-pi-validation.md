@@ -3,7 +3,8 @@
 This checklist is tested on both 64-bit Ubuntu and 64-bit Raspberry Pi OS.
 It does not depend on a named deployment host or login account.
 
-Run this checklist for each device profile on its target Pi kernel.
+The USB checklist below applies to each USB profile on its target Pi kernel.
+For `mode = "device"`, use the device-profile checks at the end.
 
 ## Preflight
 
@@ -93,3 +94,23 @@ reset-like `SUSPEND`/`DISABLE`/`ENABLE` sequence. Unplug/replug while the Pi
 stays powered and confirm `DISABLE` followed by fresh enumeration. If the host
 also supplies the Pi's only power, repeat only after accepting that VBUS loss
 will cold-boot the Pi rather than produce a software lifecycle event.
+
+## Device profiles
+
+The generic privileged integration test uses `/dev/null` and requires no USB
+or I2C hardware:
+
+```sh
+sudo python3 tests/device_mode.py target/release/usb-gadget-supervisor
+```
+
+It checks inherited FD 3, non-root credentials with no supplementary groups,
+`no_new_privs`, private state directories, root-owned profile permissions,
+symlink rejection, worker failure, graceful stop, and supervisor parent death.
+
+The hardware launch path is also exercised with `virtual-yubihsm-i2c` on two
+Pi 3B+ targets. Each worker runs as `per` and continues serving through FD 3
+while `/dev/bsc-target0` is root-owned mode `0600`. SIGHUP replaces the worker;
+stopping the external `target-driver` launcher stops the worker and supervisor
+before unloading the module and overlay. Protocol qualification is documented
+in the [HSM hardware validation](https://github.com/qpernil/virtual-yubihsm/blob/main/docs/i2c.md#hardware-validation).

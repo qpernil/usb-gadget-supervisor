@@ -22,6 +22,16 @@ The goal is a deliberately small privileged boundary: the supervisor performs
 the Linux operations that require root, while each device implementation stays
 in its own independently testable process.
 
+A profile can select `mode = "device"` to run an ordinary executable with
+one character device inherited as FD 3, using the same authorization and
+credential drop without USB setup. Both modes accept an installed profile name:
+
+```sh
+sudo /opt/usb-gadget-supervisor/usb-gadget-supervisor --profile virtual-yubihsm-i2c
+```
+
+See [profile modes](docs/profile-format.md#selecting-a-profile-and-mode).
+
 ## Architecture
 
 ```text
@@ -123,6 +133,10 @@ cargo build --release --locked
 cargo test --locked
 ```
 
+Small ARM64 targets may use the checksummed convenience binary in
+[`prebuilt/aarch64/`](prebuilt/aarch64/README.md), substituting that directory
+for `target/release/` below.
+
 Install the privileged boundary in one root-owned directory:
 
 ```sh
@@ -180,8 +194,9 @@ sudo /opt/usb-gadget-supervisor/usb-gadget-supervisor \
   --profile /opt/usb-gadget-supervisor/profiles/virtual-yubikey.toml
 ```
 
-An optional `--udc NAME` selects a controller instead of the first available
-entry in `/sys/class/udc`.
+All launch settings come from the root-owned profile. Its optional top-level
+`udc = "fe980000.usb"` selects an exact controller; omitting it selects the first
+sorted entry in `/sys/class/udc`. There are no command-line launch overrides.
 
 Profiles can be schema-checked without root or USB hardware:
 

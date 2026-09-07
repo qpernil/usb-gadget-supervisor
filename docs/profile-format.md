@@ -3,14 +3,66 @@
 ## Scope
 
 The installed TOML profile describes only the privileged launch boundary: the
-worker, its FunctionFS mount, and the local hardware resources the supervisor
+worker, its mode, optional USB controller and FunctionFS mount, and the local hardware resources the supervisor
 must open before dropping privileges. USB identity and descriptors are runtime
 state owned by the worker and are not duplicated in this file.
 
 Profiles are root-owned TOML documents. Schema 1 rejects unknown fields and
 does not accept the former `[usb]` or `[[functions]]` sections.
 
-## Example
+## Selecting a profile and mode
+
+`--profile NAME` resolves `/opt/usb-gadget-supervisor/profiles/NAME.toml`.
+An absolute path selects an explicit file; relative paths are rejected. At
+launch the file must be a root-owned, non-symlink regular file without set-ID
+bits or group/other write permission. `--check-profile` validates the schema
+without root or hardware. Launch settings have no CLI overrides.
+
+`mode = "usb"` is the default. `mode = "device"` launches an ordinary
+executable with one character device explicitly mapped as `fd = 3`. Device
+mode omits `udc`, `functionfs_mount`, and `worker.readiness_timeout_ms`, and skips USB setup and all worker control records. It retains the
+same account checks, credential drop, environment clearing, and private
+state/runtime directories. It needs neither a USB controller nor a worker
+protocol implementation.
+
+```toml
+schema = 1
+mode = "device"
+name = "example-device"
+
+[worker]
+command = "/absolute/path/to/example-worker"
+arguments = ["--inherited-device"]
+run_as = "per"
+state_directory = "/var/lib/example-device"
+runtime_directory = "/run/example-device"
+
+[[resources]]
+type = "character-device"
+name = "target"
+path = "/dev/example-target"
+access = "read-write"
+fd = 3
+```
+
+The resource list and explicit `fd` fields can describe multiple descriptor
+assignments. The current implementation validates exactly one character-device
+resource with `fd = 3`; this is an implementation limit, not a different file
+format. Extending descriptor mapping can preserve existing profiles.
+The executable consumes that handle by convention; it does not read the
+profile. There is no readiness handshake. Worker exit ends the run, reporting
+failure for a nonzero exit; systemd supplies restart policy. Stop sends SIGTERM
+with bounded time to exit before SIGKILL. SIGHUP stops the worker and reloads
+the root-owned profile. Mode/name changes require a service restart. Device
+profiles use separate locks and do not acquire the USB controller lock.
+Driver loading is separate; profiles contain no privileged shell hooks.
+
+In USB mode, optional top-level `udc = "fe980000.usb"` selects an exact entry
+in `/sys/class/udc`. Omit it to select the first controller in sorted order.
+UDC names cannot contain paths or whitespace. Reload validates and resolves the
+replacement selection before stopping the existing worker and rebinding.
+
+## USB example
 
 ```toml
 schema = 1
@@ -63,13 +115,15 @@ USB-reconfiguration handshake, not ordinary USB traffic.
 
 The supervisor clears the inherited environment, supplies `STATE_DIRECTORY`
 and `RUNTIME_DIRECTORY`, and places its `SOCK_SEQPACKET` control socket on file
-descriptor 3. Persistent device state belongs under the state directory;
+descriptor 3 in USB mode. Device mode instead inherits the declared device
+on FD 3. Persistent device state belongs under the state directory;
 temporary worker files belong under the runtime directory.
 
 ## Local hardware resources
 
 Every resource is mandatory and has a unique name. Resource names and open
-descriptors are sent together in profile order in the initial control record.
+descriptors are sent together in profile order in the initial control record
+in USB mode, where `fd` must be omitted. Device mode sends no control record.
 
 A `character-device` resource opens one non-symlink device under `/dev` with
 `access` set to `read`, `write`, or `read-write`. This is suitable for I2C and
@@ -87,7 +141,7 @@ additional lines. Overlapping claims on one chip are rejected.
 
 ## USB configuration
 
-After receiving its local resources, the worker sends a `Configure` record
+In USB mode, after receiving its local resources, the worker sends a `Configure` record
 whose body is the schema-1 CBOR `UsbPersonality`. That object contains:
 
 - maximum USB speed;

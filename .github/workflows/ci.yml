@@ -23,6 +23,10 @@ jobs:
         run: cargo fmt --check
       - name: Test
         run: cargo test --locked
+      - name: Device profile launch boundary
+        run: |
+          cargo build --locked
+          sudo python3 tests/device_mode.py "$PWD/target/debug/usb-gadget-supervisor"
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 

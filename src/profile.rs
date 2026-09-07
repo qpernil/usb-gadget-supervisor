@@ -9,10 +9,22 @@ use std::path::{Path, PathBuf};
 pub(crate) struct Profile {
     pub(crate) schema: u32,
     pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) mode: Mode,
+    #[serde(default)]
     pub(crate) functionfs_mount: PathBuf,
+    pub(crate) udc: Option<String>,
     pub(crate) worker: WorkerProfile,
     #[serde(default)]
     pub(crate) resources: Vec<ResourceProfile>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Mode {
+    #[default]
+    Usb,
+    Device,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -44,6 +56,7 @@ pub(crate) struct CharacterDeviceResource {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
     pub(crate) access: ResourceAccess,
+    pub(crate) fd: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -98,6 +111,7 @@ pub(crate) struct WorkerProfile {
     #[serde(default)]
     pub(crate) arguments: Vec<String>,
     pub(crate) run_as: String,
+    #[serde(default)]
     pub(crate) readiness_timeout_ms: u64,
     pub(crate) state_directory: PathBuf,
     pub(crate) runtime_directory: PathBuf,
@@ -126,17 +140,50 @@ impl Profile {
             return invalid(format!("unsupported profile schema {}", self.schema));
         }
         validate_name("profile", &self.name)?;
-        validate_absolute("functionfs_mount", &self.functionfs_mount)?;
-        let mount_name = self
-            .functionfs_mount
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        if self.functionfs_mount.parent() != Some(Path::new("/dev"))
-            || !mount_name.starts_with("ffs-")
-            || mount_name.len() == 4
-        {
-            return invalid("functionfs_mount must use the /dev/ffs-* namespace");
+        match self.mode {
+            Mode::Usb => {
+                if let Some(udc) = &self.udc
+                    && (udc.is_empty()
+                        || !udc
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte)))
+                {
+                    return invalid(format!("invalid UDC name: {udc}"));
+                }
+                validate_absolute("functionfs_mount", &self.functionfs_mount)?;
+                let mount_name = self
+                    .functionfs_mount
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if self.functionfs_mount.parent() != Some(Path::new("/dev"))
+                    || !mount_name.starts_with("ffs-")
+                    || mount_name.len() == 4
+                {
+                    return invalid("functionfs_mount must use the /dev/ffs-* namespace");
+                }
+            }
+            Mode::Device => {
+                if self.udc.is_some()
+                    || !self.functionfs_mount.as_os_str().is_empty()
+                    || self.worker.readiness_timeout_ms != 0
+                {
+                    return invalid(
+                        "device mode must omit udc, functionfs_mount, and readiness_timeout_ms",
+                    );
+                }
+                if !matches!(
+                    self.resources.as_slice(),
+                    [ResourceProfile::CharacterDevice(CharacterDeviceResource {
+                        fd: Some(3),
+                        ..
+                    })]
+                ) {
+                    return invalid(
+                        "device mode requires exactly one character-device resource with fd = 3",
+                    );
+                }
+            }
         }
 
         validate_absolute("worker.command", &self.worker.command)?;
@@ -154,7 +201,9 @@ impl Profile {
         if self.worker.run_as == "root" {
             return invalid("worker.run_as must not be root");
         }
-        if self.worker.readiness_timeout_ms == 0 || self.worker.readiness_timeout_ms > 120_000 {
+        if self.mode == Mode::Usb
+            && (self.worker.readiness_timeout_ms == 0 || self.worker.readiness_timeout_ms > 120_000)
+        {
             return invalid("worker.readiness_timeout_ms must be between 1 and 120000");
         }
 
@@ -172,6 +221,9 @@ impl Profile {
             }
             match resource {
                 ResourceProfile::CharacterDevice(resource) => {
+                    if self.mode == Mode::Usb && resource.fd.is_some() {
+                        return invalid("USB resources use the worker protocol and must omit fd");
+                    }
                     if is_gpio_chip_path(&resource.path) {
                         return invalid(format!(
                             "GPIO chip {} must be declared as a gpio-lines resource",
@@ -314,6 +366,67 @@ runtime_directory = "/run/test-device"
         let profile: Profile = toml::from_str(VALID).unwrap();
         profile.validate().unwrap();
         assert_eq!(profile.functionfs_mount, Path::new("/dev/ffs-test-device"));
+        assert_eq!(profile.mode, Mode::Usb);
+    }
+
+    #[test]
+    fn device_mode_requires_one_device_and_no_usb_configuration() {
+        let base = VALID
+            .replace(
+                r#"functionfs_mount = "/dev/ffs-test-device""#,
+                r#"mode = "device""#,
+            )
+            .replace("readiness_timeout_ms = 10000", "");
+        let resource = r#"
+[[resources]]
+type = "character-device"
+name = "target"
+path = "/dev/null"
+access = "read-write"
+fd = 3
+"#;
+        let valid = format!("{base}{resource}");
+        let profile: Profile = toml::from_str(&valid).unwrap();
+        profile.validate().unwrap();
+        assert_eq!(profile.mode, Mode::Device);
+        for invalid in [
+            base,
+            valid.replace("schema = 1", "schema = 1\nudc = \"fe980000.usb\""),
+            valid.replace("fd = 3", "fd = 4"),
+            valid.replace("fd = 3", ""),
+            format!("{valid}{resource}"),
+            valid.replace(r#"mode = "device""#, r#"mode = "usb""#),
+            valid.replace(
+                r#"mode = "device""#,
+                "mode = \"device\"\nfunctionfs_mount = \"/dev/ffs-test\"",
+            ),
+            valid.replace(r#"run_as = "device-worker""#, r#"run_as = "root""#),
+            valid.replace("[worker]", "[worker]\nreadiness_timeout_ms = 1000"),
+        ] {
+            assert!(
+                toml::from_str::<Profile>(&invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn validates_profile_controller_selection() {
+        let selected =
+            |name: &str| toml::from_str::<Profile>(&format!("udc = {name:?}\n{VALID}")).unwrap();
+        let profile = selected("fe980000.usb");
+        profile.validate().unwrap();
+        assert_eq!(profile.udc.as_deref(), Some("fe980000.usb"));
+        for name in [
+            "",
+            "../controller",
+            "/sys/class/udc/test",
+            "two controllers",
+        ] {
+            assert!(selected(name).validate().is_err());
+        }
     }
 
     #[test]

@@ -41,6 +41,16 @@ the worker. It never reads or writes device-protocol payloads.
 The disk profile contains no USB descriptors. The worker publishes one complete
 typed configuration at startup and may publish a replacement later.
 
+## Plain device workers
+
+A `mode = "device"` profile uses the same root-owned launch policy and
+credential drop. Its one character device, with `fd = 3`, is opened as root
+and inherited across exec. The parent closes its copy after launch. The worker
+uses the device directly; it needs no USB controller or control protocol.
+Driver setup and device protocol remain outside the supervisor. Device workers
+run once, with restart policy supplied by systemd; SIGHUP stops the worker and
+reloads the root-owned profile. The USB lifecycle below applies to USB mode.
+
 ## Worker-side USB description
 
 The shared Rust crate defines `UsbPersonality`, one
@@ -167,7 +177,7 @@ controller. The complete mapping is in [USB lifecycle](usb-lifecycle.md).
 ## UDC and Raspberry Pi
 
 The supervisor discovers controllers through `/sys/class/udc`, sorts them, and
-selects the first unless an exact `--udc` override is given. One UDC exposes one
+selects the first unless the root-owned profile specifies an exact `udc` name. One UDC exposes one
 USB device identity at a time. Pi 4 and Pi 5 use the same DWC2 peripheral-mode,
 ConfigFS, and FunctionFS architecture; their UDC names differ, so no name is
 hard-coded.

@@ -2,7 +2,7 @@
 
 use crate::functionfs::{self, Direction};
 use crate::profile::{
-    CharacterDeviceResource, GpioBias, GpioDirection, GpioEdge, GpioLinesResource, Profile,
+    CharacterDeviceResource, GpioBias, GpioDirection, GpioEdge, GpioLinesResource, Mode, Profile,
     ResourceAccess, ResourceProfile,
 };
 use crate::protocol::{self, CONTROL_FD, Kind, RUNTIME_DIRECTORY_ENV, Record, STATE_DIRECTORY_ENV};
@@ -62,11 +62,7 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
-    pub(crate) fn setup(
-        profile_path: PathBuf,
-        profile: Profile,
-        requested_udc: Option<&str>,
-    ) -> io::Result<Self> {
+    pub(crate) fn setup(profile_path: PathBuf, profile: Profile) -> io::Result<Self> {
         if unsafe { libc::geteuid() } != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -76,10 +72,10 @@ impl Runtime {
         validate_root_owned_file(&profile_path, "profile")?;
         let identity = resolve_worker_identity(&profile.worker.run_as)?;
         validate_worker_executable(&profile.worker.command, &identity)?;
-        let lock = acquire_lock()?;
+        let lock = acquire_lock(Path::new(LOCK_FILE))?;
         let configfs_mounted_by_us = ensure_configfs()?;
         let gadget = Path::new(GADGET_ROOT).join(&profile.name);
-        let udc = select_udc(requested_udc)?;
+        let udc = select_udc(profile.udc.as_deref())?;
         let mut runtime = Self {
             profile_path,
             profile,
@@ -227,9 +223,6 @@ impl Runtime {
             self.profile.worker.readiness_timeout_ms,
         )))?;
         let control_fd = worker_channel.as_raw_fd();
-        let parent_pid = std::process::id() as libc::pid_t;
-        let uid = self.identity.uid;
-        let gid = self.identity.gid;
         let mut command = Command::new(&self.profile.worker.command);
         command
             .args(&self.profile.worker.arguments)
@@ -242,33 +235,7 @@ impl Runtime {
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        unsafe {
-            command.pre_exec(move || {
-                if control_fd != CONTROL_FD && libc::dup2(control_fd, CONTROL_FD) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::fcntl(CONTROL_FD, libc::F_SETFD, 0) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::setgroups(0, std::ptr::null()) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::getppid() != parent_pid {
-                    return Err(io::Error::from_raw_os_error(libc::EPIPE));
-                }
-                Ok(())
-            });
-        }
-        let child = command.spawn()?;
+        let child = spawn_unprivileged(&mut command, &self.identity, control_fd)?;
         drop(worker_channel);
         let body = resource_names(&self.profile.resources)?;
         let record = Record::new(Kind::InitialResources, 0, 0, body);
@@ -653,8 +620,12 @@ impl Runtime {
     fn reload_profile(&mut self) -> io::Result<()> {
         validate_root_owned_file(&self.profile_path, "profile")?;
         let profile = Profile::load(&self.profile_path)?;
+        if profile.mode != Mode::Usb {
+            return invalid("changing profile mode requires a service restart");
+        }
         let identity = resolve_worker_identity(&profile.worker.run_as)?;
         validate_worker_executable(&profile.worker.command, &identity)?;
+        let udc = select_udc(profile.udc.as_deref())?;
         if self.owns_gadget {
             self.unbind()?;
         }
@@ -665,6 +636,7 @@ impl Runtime {
         stop_worker(&mut self.worker)?;
         self.stop_usb_generation()?;
         self.profile = profile;
+        self.udc = udc;
         self.identity = identity;
         self.gadget = Path::new(GADGET_ROOT).join(&self.profile.name);
         self.generation = 0;
@@ -810,27 +782,10 @@ impl Runtime {
             .resources
             .iter()
             .map(|resource| match resource {
-                ResourceProfile::CharacterDevice(resource) => self.open_character_device(resource),
+                ResourceProfile::CharacterDevice(resource) => open_character_device(resource),
                 ResourceProfile::GpioLines(resource) => self.request_gpio_lines(resource),
             })
             .collect()
-    }
-
-    fn open_character_device(&self, resource: &CharacterDeviceResource) -> io::Result<File> {
-        validate_character_device(&resource.name, &resource.path)?;
-        let mut options = OpenOptions::new();
-        match resource.access {
-            ResourceAccess::Read => {
-                options.read(true);
-            }
-            ResourceAccess::Write => {
-                options.write(true);
-            }
-            ResourceAccess::ReadWrite => {
-                options.read(true).write(true);
-            }
-        }
-        options.open(&resource.path)
     }
 
     fn request_gpio_lines(&self, resource: &GpioLinesResource) -> io::Result<File> {
@@ -1197,13 +1152,14 @@ fn query_account_id(flag: &str, name: &str) -> io::Result<u32> {
         .map_err(io::Error::other)
 }
 
-fn acquire_lock() -> io::Result<File> {
+fn acquire_lock(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(LOCK_FILE)?;
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1409,4 +1365,158 @@ fn record_error(first: &mut Option<io::Error>, result: io::Result<()>) {
 }
 fn invalid<T>(message: impl Into<String>) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidData, message.into()))
+}
+
+fn open_character_device(resource: &CharacterDeviceResource) -> io::Result<File> {
+    validate_character_device(&resource.name, &resource.path)?;
+    let mut options = OpenOptions::new();
+    match resource.access {
+        ResourceAccess::Read => {
+            options.read(true);
+        }
+        ResourceAccess::Write => {
+            options.write(true);
+        }
+        ResourceAccess::ReadWrite => {
+            options.read(true).write(true);
+        }
+    }
+    let file = options
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&resource.path)?;
+    if !file.metadata()?.file_type().is_char_device() {
+        return invalid("resource changed to a non-character device while opening");
+    }
+    Ok(file)
+}
+
+// Both modes share credential dropping, descriptor 3, and parent-death protection.
+fn spawn_unprivileged(
+    command: &mut Command,
+    identity: &WorkerIdentity,
+    descriptor: i32,
+) -> io::Result<Child> {
+    let parent_pid = std::process::id() as libc::pid_t;
+    let uid = identity.uid;
+    let gid = identity.gid;
+    unsafe {
+        command.pre_exec(move || {
+            if descriptor != CONTROL_FD && libc::dup2(descriptor, CONTROL_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(CONTROL_FD, libc::F_SETFD, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                return Err(io::Error::from_raw_os_error(libc::EPIPE));
+            }
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
+/// A profile-authorized device worker needs no USB objects or control protocol.
+pub(crate) fn run_device(
+    profile_path: PathBuf,
+    mut profile: Profile,
+    signal_fd: i32,
+) -> io::Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return invalid("device supervision needs root");
+    }
+    validate_root_owned_file(&profile_path, "profile")?;
+    let name = profile.name.clone();
+    let _lock = acquire_lock(&PathBuf::from(format!(
+        "/run/usb-gadget-supervisor-device-{name}.lock"
+    )))?;
+    loop {
+        let identity = resolve_worker_identity(&profile.worker.run_as)?;
+        validate_worker_executable(&profile.worker.command, &identity)?;
+        prepare_owned_directory(&profile.worker.state_directory, identity.uid, identity.gid)?;
+        prepare_owned_directory(
+            &profile.worker.runtime_directory,
+            identity.uid,
+            identity.gid,
+        )?;
+        let [ResourceProfile::CharacterDevice(resource)] = profile.resources.as_slice() else {
+            return invalid("device mode requires one character device");
+        };
+        let device = open_character_device(resource)?;
+        let mut command = Command::new(&profile.worker.command);
+        command
+            .args(&profile.worker.arguments)
+            .env_clear()
+            .env(STATE_DIRECTORY_ENV, &profile.worker.state_directory)
+            .env(RUNTIME_DIRECTORY_ENV, &profile.worker.runtime_directory)
+            .stdin(Stdio::null());
+        let child = spawn_unprivileged(&mut command, &identity, device.as_raw_fd())?;
+        drop(device);
+        let mut worker = Some(child);
+        let result = (|| {
+            loop {
+                if STOP_REQUESTED.load(Ordering::Relaxed)
+                    || RESTART_REQUESTED.load(Ordering::Relaxed)
+                {
+                    return Ok(None);
+                }
+                if let Some(status) = worker.as_mut().unwrap().try_wait()? {
+                    return Ok(Some(status));
+                }
+                let mut pollfd = libc::pollfd {
+                    fd: signal_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut pollfd, 1, -1) } < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                } else {
+                    drain_signal_notifications(signal_fd)?;
+                }
+            }
+        })();
+        // There is no control channel to close; explicitly request a graceful exit.
+        let signal_result = match worker.as_mut().unwrap().try_wait() {
+            Ok(None) => signal_child(worker.as_ref().unwrap(), libc::SIGTERM),
+            Ok(Some(_)) => Ok(()),
+            Err(error) => Err(error),
+        };
+        let cleanup_result = stop_worker(&mut worker);
+        let status = result?;
+        signal_result.and(cleanup_result)?;
+        remove_dir_if_exists(&profile.worker.runtime_directory)?;
+        if STOP_REQUESTED.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if RESTART_REQUESTED.swap(false, Ordering::Relaxed) {
+            validate_root_owned_file(&profile_path, "profile")?;
+            profile = Profile::load(&profile_path)?;
+            if profile.mode != Mode::Device || profile.name != name {
+                return invalid("changing profile mode or name requires a service restart");
+            }
+            continue;
+        }
+        return match status {
+            Some(status) if status.success() => Ok(()),
+            Some(status) => Err(io::Error::other(format!(
+                "device worker exited with {status}"
+            ))),
+            None => Ok(()),
+        };
+    }
 }
