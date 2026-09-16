@@ -4,27 +4,30 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
-`usb-gadget-supervisor` is a privilege-separated Linux service for
-running protocol-compatible USB device workers on a USB Device Controller
-(UDC), especially on Raspberry Pi 4 and Raspberry Pi 5.
+`usb-gadget-supervisor` is a privilege-separated Linux service for running
+unprivileged device workers. Its primary use is protocol-compatible USB
+devices on a USB Device Controller (UDC), especially on Raspberry Pi 4 and
+Raspberry Pi 5. Device mode also supports typed local resources such as the
+Raspberry Pi 3/4 BSC I2C target.
 
 Deployment is tested on both 64-bit Ubuntu and 64-bit Raspberry Pi OS. On
 either system, the normal board-specific prerequisite is to enable DWC2 in
 peripheral mode; the supervisor then uses the resulting UDC through ConfigFS
 and FunctionFS.
 
-The supervisor owns only the privileged mechanics of Linux USB gadget mode:
-ConfigFS, FunctionFS mounts, UDC binding, process credentials, lifecycle, and
-cleanup. Device behavior belongs to separate unprivileged workers such as
+The supervisor owns only privileged Linux mechanics: ConfigFS, FunctionFS
+mounts, UDC binding, typed device resources, process credentials, lifecycle,
+and cleanup. Device behavior belongs to separate unprivileged workers such as
 `virtual-yubikey`, `virtual-trezor`, and `virtual-yubihsm`.
 
 The goal is a deliberately small privileged boundary: the supervisor performs
 the Linux operations that require root, while each device implementation stays
 in its own independently testable process.
 
-A profile can select `mode = "device"` to run an ordinary executable with
-one character device inherited as FD 3, using the same authorization and
-credential drop without USB setup. Both modes accept an installed profile name:
+A profile can select `mode = "device"` to run an ordinary executable with one
+plain or supervisor-managed character device inherited as FD 3, using the same
+authorization and credential drop without USB setup. Both modes accept an
+installed profile name:
 
 ```sh
 sudo /opt/usb-gadget-supervisor/usb-gadget-supervisor --profile virtual-yubihsm-i2c
@@ -61,7 +64,7 @@ control/lifecycle events but stays out of the packet path. Typed Microsoft OS
 
 | Project | Responsibility |
 | --- | --- |
-| `usb-gadget-supervisor` | CBOR USB schema/discovery helper, ConfigFS, FunctionFS, UDC ownership, privilege dropping, bind/unbind/reconfiguration, cleanup |
+| `usb-gadget-supervisor` | CBOR USB schema/discovery helper, ConfigFS, FunctionFS, typed local-resource ownership, privilege dropping, bind/unbind/reconfiguration, cleanup |
 | [`virtual-yubikey`](https://github.com/qpernil/virtual-yubikey) | Native YubiKey personality publisher, FIDO HID, CCID, Management, PIV, FIDO2, display, touch, and state |
 | `virtual-trezor` | Upstream firmware build and descriptor discovery, Pi HAL, OLED/buttons, state |
 | `virtual-yubihsm` | YubiHSM protocol, sessions, objects, capabilities, audit, state |
@@ -126,7 +129,10 @@ device UI. Those concerns stay in the worker repositories.
 ## Build
 
 Rust 1.94 or later is required. The binary is Linux-only, while profile and
-wire-format unit tests also run on macOS:
+wire-format unit tests also run on macOS. Keep
+`usb-gadget-supervisor` and `raspberry-pi-i2c-target` as sibling checkouts; the
+supervisor uses the target repository's lifecycle library through a sibling
+path dependency:
 
 ```sh
 cargo build --release --locked

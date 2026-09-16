@@ -31,6 +31,7 @@ pub(crate) enum Mode {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub(crate) enum ResourceProfile {
     CharacterDevice(CharacterDeviceResource),
+    BscTarget(BscTargetResource),
     GpioLines(GpioLinesResource),
 }
 
@@ -38,6 +39,7 @@ impl ResourceProfile {
     pub(crate) fn name(&self) -> &str {
         match self {
             Self::CharacterDevice(resource) => &resource.name,
+            Self::BscTarget(resource) => &resource.name,
             Self::GpioLines(resource) => &resource.name,
         }
     }
@@ -45,9 +47,61 @@ impl ResourceProfile {
     pub(crate) fn path(&self) -> &Path {
         match self {
             Self::CharacterDevice(resource) => &resource.path,
+            Self::BscTarget(resource) => &resource.path,
             Self::GpioLines(resource) => &resource.path,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BscTargetResource {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) kernel_directory: PathBuf,
+    pub(crate) module: String,
+    pub(crate) address: u16,
+    pub(crate) ready_gpio: Option<u32>,
+    #[serde(default)]
+    pub(crate) idle_pull: BscIdlePull,
+    pub(crate) fd: Option<u32>,
+    pub(crate) variants: Vec<BscTargetVariant>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BscTargetVariant {
+    pub(crate) model_contains: String,
+    pub(crate) overlay: String,
+    pub(crate) target_gpios: Vec<u32>,
+}
+
+impl BscTargetResource {
+    pub(crate) fn select_variant(&self, model: &str) -> io::Result<&BscTargetVariant> {
+        let mut variants = self
+            .variants
+            .iter()
+            .filter(|variant| model.contains(&variant.model_contains));
+        let variant = variants.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("BSC target profile has no variant for {model:?}"),
+            )
+        })?;
+        if variants.next().is_some() {
+            return invalid("BSC target profile has multiple matching model variants");
+        }
+        Ok(variant)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum BscIdlePull {
+    #[default]
+    None,
+    Down,
+    Up,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -177,10 +231,13 @@ impl Profile {
                     [ResourceProfile::CharacterDevice(CharacterDeviceResource {
                         fd: Some(3),
                         ..
+                    })] | [ResourceProfile::BscTarget(BscTargetResource {
+                        fd: Some(3),
+                        ..
                     })]
                 ) {
                     return invalid(
-                        "device mode requires exactly one character-device resource with fd = 3",
+                        "device mode requires exactly one character-device or bsc-target resource with fd = 3",
                     );
                 }
             }
@@ -229,6 +286,59 @@ impl Profile {
                             "GPIO chip {} must be declared as a gpio-lines resource",
                             resource.path.display()
                         ));
+                    }
+                    if !character_device_paths.insert(resource.path.as_path()) {
+                        return invalid(format!(
+                            "duplicate character-device resource path {}",
+                            resource.path.display()
+                        ));
+                    }
+                }
+                ResourceProfile::BscTarget(resource) => {
+                    if self.mode != Mode::Device {
+                        return invalid("bsc-target resources require device mode");
+                    }
+                    if resource.path != Path::new("/dev/bsc-target0") {
+                        return invalid("bsc-target path must be /dev/bsc-target0");
+                    }
+                    if !(0x08..=0x77).contains(&resource.address) {
+                        return invalid("bsc-target address must be in 0x08..=0x77");
+                    }
+                    if resource.ready_gpio.is_some_and(|gpio| gpio > 53) {
+                        return invalid("bsc-target ready_gpio must be in 0..=53");
+                    }
+                    validate_absolute("bsc-target kernel_directory", &resource.kernel_directory)?;
+                    validate_artifact_name("bsc-target module", &resource.module)?;
+                    if resource.variants.is_empty() || resource.variants.len() > 16 {
+                        return invalid("bsc-target requires 1 to 16 model variants");
+                    }
+                    let mut models = HashSet::new();
+                    for variant in &resource.variants {
+                        if variant.model_contains.is_empty()
+                            || variant.model_contains.contains('\0')
+                            || !models.insert(variant.model_contains.as_str())
+                        {
+                            return invalid(
+                                "bsc-target model_contains values must be nonempty and unique",
+                            );
+                        }
+                        validate_artifact_name("bsc-target overlay", &variant.overlay)?;
+                        if variant.target_gpios.len() != 2
+                            || variant.target_gpios.iter().any(|gpio| *gpio > 53)
+                            || variant.target_gpios[0] == variant.target_gpios[1]
+                        {
+                            return invalid(
+                                "bsc-target target_gpios must contain two distinct GPIOs in 0..=53",
+                            );
+                        }
+                        if resource
+                            .ready_gpio
+                            .is_some_and(|gpio| variant.target_gpios.contains(&gpio))
+                        {
+                            return invalid(
+                                "bsc-target ready_gpio conflicts with a target SDA/SCL GPIO",
+                            );
+                        }
                     }
                     if !character_device_paths.insert(resource.path.as_path()) {
                         return invalid(format!(
@@ -299,6 +409,17 @@ fn validate_name(label: &str, value: &str) -> io::Result<()> {
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    {
+        return invalid(format!("invalid {label} name {value:?}"));
+    }
+    Ok(())
+}
+
+fn validate_artifact_name(label: &str, value: &str) -> io::Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
     {
         return invalid(format!("invalid {label} name {value:?}"));
     }
@@ -402,6 +523,83 @@ fd = 3
             ),
             valid.replace(r#"run_as = "device-worker""#, r#"run_as = "root""#),
             valid.replace("[worker]", "[worker]\nreadiness_timeout_ms = 1000"),
+        ] {
+            assert!(
+                toml::from_str::<Profile>(&invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn validates_bsc_target_resource() {
+        let base = VALID
+            .replace(
+                r#"functionfs_mount = "/dev/ffs-test-device""#,
+                r#"mode = "device""#,
+            )
+            .replace("readiness_timeout_ms = 10000", "");
+        let resource = r#"
+[[resources]]
+type = "bsc-target"
+name = "target"
+path = "/dev/bsc-target0"
+kernel_directory = "/opt/usb-gadget-supervisor/bsc-target"
+module = "bcm27xx_bsc_target"
+address = 0x24
+ready_gpio = 17
+idle_pull = "none"
+fd = 3
+
+[[resources.variants]]
+model_contains = "Raspberry Pi 3 Model B"
+overlay = "bsc-target-pi3"
+target_gpios = [18, 19]
+
+[[resources.variants]]
+model_contains = "Raspberry Pi 4 Model B"
+overlay = "bsc-target-pi4"
+target_gpios = [10, 11]
+"#;
+        let valid = format!("{base}{resource}");
+        let profile: Profile = toml::from_str(&valid).unwrap();
+        profile.validate().unwrap();
+        let ResourceProfile::BscTarget(resource) = &profile.resources[0] else {
+            panic!("expected BSC target resource");
+        };
+        assert_eq!(
+            resource
+                .select_variant("Raspberry Pi 3 Model B Plus Rev 1.3")
+                .unwrap()
+                .overlay,
+            "bsc-target-pi3"
+        );
+        assert_eq!(
+            resource
+                .select_variant("Raspberry Pi 4 Model B Rev 1.5")
+                .unwrap()
+                .overlay,
+            "bsc-target-pi4"
+        );
+        assert_eq!(
+            resource
+                .select_variant("Raspberry Pi 5 Model B Rev 1.0")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        for invalid in [
+            valid.replace("0x24", "0x02"),
+            valid.replace("ready_gpio = 17", "ready_gpio = 54"),
+            valid.replace("/dev/bsc-target0", "/dev/other"),
+            valid.replace("fd = 3", "fd = 4"),
+            valid.replace(r#"mode = "device""#, r#"mode = "usb""#),
+            valid.replace("/opt/usb-gadget-supervisor/bsc-target", "relative/kernel"),
+            valid.replace("bcm27xx_bsc_target", "../module"),
+            valid.replace("target_gpios = [18, 19]", "target_gpios = [18, 18]"),
+            valid.replace("ready_gpio = 17", "ready_gpio = 18"),
         ] {
             assert!(
                 toml::from_str::<Profile>(&invalid)

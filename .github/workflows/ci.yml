@@ -15,27 +15,44 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: usb-gadget-supervisor
+      - uses: actions/checkout@v7
+        with:
+          repository: qpernil/raspberry-pi-i2c-target
+          path: raspberry-pi-i2c-target
       - name: Install Rust components
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - name: Select Rust stable
         run: rustup default stable
       - name: Check formatting
         run: cargo fmt --check
+        working-directory: usb-gadget-supervisor
       - name: Test
         run: cargo test --locked
+        working-directory: usb-gadget-supervisor
       - name: Device profile launch boundary
         run: |
           cargo build --locked
           sudo python3 tests/device_mode.py "$PWD/target/debug/usb-gadget-supervisor"
+        working-directory: usb-gadget-supervisor
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: usb-gadget-supervisor
 
   msrv:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: usb-gadget-supervisor
+      - uses: actions/checkout@v7
+        with:
+          repository: qpernil/raspberry-pi-i2c-target
+          path: raspberry-pi-i2c-target
       - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@1.94.0
       - name: Check minimum supported Rust version
         run: cargo check --locked --workspace --all-targets
+        working-directory: usb-gadget-supervisor

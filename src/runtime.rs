@@ -2,12 +2,15 @@
 
 use crate::functionfs::{self, Direction};
 use crate::profile::{
-    CharacterDeviceResource, GpioBias, GpioDirection, GpioEdge, GpioLinesResource, Mode, Profile,
-    ResourceAccess, ResourceProfile,
+    BscIdlePull, BscTargetResource, CharacterDeviceResource, GpioBias, GpioDirection, GpioEdge,
+    GpioLinesResource, Mode, Profile, ResourceAccess, ResourceProfile,
 };
 use crate::protocol::{self, CONTROL_FD, Kind, RUNTIME_DIRECTORY_ENV, Record, STATE_DIRECTORY_ENV};
 use crate::usb_personality::{self, Personality};
 use crate::{RESTART_REQUESTED, STOP_REQUESTED};
+use raspberry_i2c_link::kernel_target::{
+    DriverConfiguration, DriverGuard, IdlePull, unload_existing_configured,
+};
 use std::ffi::{CString, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -783,6 +786,9 @@ impl Runtime {
             .iter()
             .map(|resource| match resource {
                 ResourceProfile::CharacterDevice(resource) => open_character_device(resource),
+                ResourceProfile::BscTarget(_) => {
+                    invalid("bsc-target resources require device mode")
+                }
                 ResourceProfile::GpioLines(resource) => self.request_gpio_lines(resource),
             })
             .collect()
@@ -1083,6 +1089,77 @@ fn validate_root_owned_file(path: &Path, label: &str) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_root_owned_directory(path: &Path, label: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o6022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{label} {} must be a root-owned, non-set-ID, non-writable directory",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn open_bsc_target(resource: &BscTargetResource) -> io::Result<(File, DriverGuard)> {
+    validate_root_owned_directory(&resource.kernel_directory, "BSC kernel directory")?;
+    validate_root_owned_file(
+        &resource
+            .kernel_directory
+            .join(format!("{}.ko", resource.module)),
+        "BSC kernel artifact",
+    )?;
+    for variant in &resource.variants {
+        validate_root_owned_file(
+            &resource
+                .kernel_directory
+                .join(format!("{}.dtbo", variant.overlay)),
+            "BSC kernel artifact",
+        )?;
+    }
+    let model = fs::read("/proc/device-tree/model")?;
+    let model = String::from_utf8_lossy(&model);
+    let variant = resource.select_variant(model.trim_end_matches('\0'))?;
+    let configuration = DriverConfiguration {
+        hardware_name: &variant.model_contains,
+        model_contains: &variant.model_contains,
+        overlay: &variant.overlay,
+        module: &resource.module,
+        device: &resource.path,
+        target_pins: &variant.target_gpios,
+    };
+    let idle_pull = match resource.idle_pull {
+        BscIdlePull::None => IdlePull::None,
+        BscIdlePull::Down => IdlePull::Down,
+        BscIdlePull::Up => IdlePull::Up,
+    };
+    // Recover a stale inactive instance, while rmmod safely refuses an active owner.
+    unload_existing_configured(configuration)?;
+    let guard = DriverGuard::load_configured(
+        &resource.kernel_directory,
+        configuration,
+        resource.address,
+        idle_pull,
+        resource.ready_gpio,
+    )?;
+    validate_character_device(&resource.name, &resource.path)?;
+    let device = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&resource.path)?;
+    if !device.metadata()?.file_type().is_char_device() {
+        return invalid("BSC target changed to a non-character device while opening");
+    }
+    Ok((device, guard))
 }
 
 fn validate_worker_executable(path: &Path, identity: &WorkerIdentity) -> io::Result<()> {
@@ -1451,10 +1528,16 @@ pub(crate) fn run_device(
             identity.uid,
             identity.gid,
         )?;
-        let [ResourceProfile::CharacterDevice(resource)] = profile.resources.as_slice() else {
-            return invalid("device mode requires one character device");
+        let (device, mut bsc_guard) = match profile.resources.as_slice() {
+            [ResourceProfile::CharacterDevice(resource)] => {
+                (open_character_device(resource)?, None)
+            }
+            [ResourceProfile::BscTarget(resource)] => {
+                let (device, guard) = open_bsc_target(resource)?;
+                (device, Some(guard))
+            }
+            _ => return invalid("device mode requires one device resource"),
         };
-        let device = open_character_device(resource)?;
         let mut command = Command::new(&profile.worker.command);
         command
             .args(&profile.worker.arguments)
@@ -1497,8 +1580,10 @@ pub(crate) fn run_device(
             Err(error) => Err(error),
         };
         let cleanup_result = stop_worker(&mut worker);
-        let status = result?;
-        signal_result.and(cleanup_result)?;
+        let status_result = result;
+        let resource_cleanup = bsc_guard.as_mut().map_or(Ok(()), DriverGuard::unload);
+        let status = status_result?;
+        signal_result.and(cleanup_result).and(resource_cleanup)?;
         remove_dir_if_exists(&profile.worker.runtime_directory)?;
         if STOP_REQUESTED.load(Ordering::Relaxed) {
             return Ok(());

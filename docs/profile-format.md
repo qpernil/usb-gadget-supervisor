@@ -19,7 +19,8 @@ bits or group/other write permission. `--check-profile` validates the schema
 without root or hardware. Launch settings have no CLI overrides.
 
 `mode = "usb"` is the default. `mode = "device"` launches an ordinary
-executable with one character device explicitly mapped as `fd = 3`. Device
+executable with one character device or managed BSC target explicitly mapped
+as `fd = 3`. Device
 mode omits `udc`, `functionfs_mount`, and `worker.readiness_timeout_ms`, and skips USB setup and all worker control records. It retains the
 same account checks, credential drop, environment clearing, and private
 state/runtime directories. It needs neither a USB controller nor a worker
@@ -46,16 +47,17 @@ fd = 3
 ```
 
 The resource list and explicit `fd` fields can describe multiple descriptor
-assignments. The current implementation validates exactly one character-device
-resource with `fd = 3`; this is an implementation limit, not a different file
-format. Extending descriptor mapping can preserve existing profiles.
+assignments. The current implementation validates exactly one
+`character-device` or `bsc-target` resource with `fd = 3`; this is an
+implementation limit, not a different file format. Extending descriptor
+mapping can preserve existing profiles.
 The executable consumes that handle by convention; it does not read the
 profile. There is no readiness handshake. Worker exit ends the run, reporting
 failure for a nonzero exit; systemd supplies restart policy. Stop sends SIGTERM
 with bounded time to exit before SIGKILL. SIGHUP stops the worker and reloads
 the root-owned profile. Mode/name changes require a service restart. Device
 profiles use separate locks and do not acquire the USB controller lock.
-Driver loading is separate; profiles contain no privileged shell hooks.
+Profiles contain no privileged shell hooks.
 
 In USB mode, optional top-level `udc = "fe980000.usb"` selects an exact entry
 in `/sys/class/udc`. Omit it to select the first controller in sorted order.
@@ -128,6 +130,48 @@ in USB mode, where `fd` must be omitted. Device mode sends no control record.
 A `character-device` resource opens one non-symlink device under `/dev` with
 `access` set to `read`, `write`, or `read-write`. This is suitable for I2C and
 SPI device nodes.
+
+A `bsc-target` resource manages the Raspberry Pi 3/4 BSC target driver as one
+typed resource. It validates root-owned module and overlay artifacts, matches
+exactly one declared variant against `/proc/device-tree/model`, loads the
+selected overlay and module, opens `/dev/bsc-target0`, and passes that handle as
+FD 3. Worker shutdown closes the device before the supervisor unloads the
+module and overlay. Startup removes a stale inactive instance; an active owner
+is protected by the kernel module's busy check.
+
+The supplied model list can describe every supported board without putting
+board-selection knowledge in the supervisor:
+
+```toml
+[[resources]]
+type = "bsc-target"
+name = "target"
+path = "/dev/bsc-target0"
+kernel_directory = "/opt/usb-gadget-supervisor/bsc-target"
+module = "bcm27xx_bsc_target"
+address = 0x24
+ready_gpio = 17
+idle_pull = "none"
+fd = 3
+
+[[resources.variants]]
+model_contains = "Raspberry Pi 3 Model B"
+overlay = "bsc-target-pi3"
+target_gpios = [18, 19]
+
+[[resources.variants]]
+model_contains = "Raspberry Pi 4 Model B"
+overlay = "bsc-target-pi4"
+target_gpios = [10, 11]
+```
+
+Exactly one variant must match. Unsupported hardware, including Raspberry Pi
+5, fails before any overlay or module is loaded. `target_gpios` prevents READY
+from being assigned to the target's SDA or SCL pin. The kernel directory,
+`<module>.ko`, and every `<overlay>.dtbo` must be root-owned regular files or
+directories without set-ID bits or group/other write permission. The worker
+receives only the open character-device descriptor; READY remains entirely in
+the kernel driver.
 
 A `gpio-lines` resource asks the Linux GPIO v2 API for exclusive ownership of
 an ordered group of 1 to 64 offsets. Input groups may set `active_low`, `bias`

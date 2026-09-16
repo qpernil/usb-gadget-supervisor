@@ -110,7 +110,7 @@ symlink rejection, worker failure, graceful stop, and supervisor parent death.
 
 The hardware launch path is also exercised with `virtual-yubihsm-i2c` on two
 Pi 3B+ targets. Each worker runs as `per` and continues serving through FD 3
-while `/dev/bsc-target0` is root-owned mode `0600`. SIGHUP replaces the worker;
-stopping the external `target-driver` launcher stops the worker and supervisor
-before unloading the module and overlay. Protocol qualification is documented
+while `/dev/bsc-target0` is root-owned mode `0600`. SIGHUP stops the worker, unloads the BSC resource, reloads the profile, and
+starts its replacement. Stopping the supervisor stops the worker and closes FD
+3 before unloading the module and overlay. Protocol qualification is documented
 in the [HSM hardware validation](https://github.com/qpernil/virtual-yubihsm/blob/main/docs/i2c.md#hardware-validation).

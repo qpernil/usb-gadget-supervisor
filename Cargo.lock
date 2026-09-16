@@ -123,6 +123,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "raspberry-i2c-link"
+version = "0.1.0"
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -264,6 +268,7 @@ version = "0.1.0"
 dependencies = [
  "gpiocdev-uapi",
  "libc",
+ "raspberry-i2c-link",
  "serde",
  "toml",
  "usb-gadget-worker",

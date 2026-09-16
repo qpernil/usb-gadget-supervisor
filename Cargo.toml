@@ -3,7 +3,7 @@ name = "usb-gadget-supervisor"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Privilege-separated Linux USB gadget lifecycle supervisor"
+description = "Privilege-separated Linux device lifecycle supervisor"
 license = "MIT"
 readme = "README.md"
 keywords = ["raspberry-pi", "usb-gadget", "functionfs", "configfs"]
@@ -22,3 +22,4 @@ usb-gadget-worker = { path = "crates/usb-gadget-worker" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpiocdev-uapi = "0.7.0"
+raspberry-i2c-link = { path = "../raspberry-pi-i2c-target", default-features = false }
