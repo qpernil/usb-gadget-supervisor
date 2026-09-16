@@ -1,4 +1,4 @@
-//! Generic privileged lifecycle supervisor for Linux USB gadget workers.
+//! Generic privileged lifecycle supervisor for Linux device workers.
 
 mod cli;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
