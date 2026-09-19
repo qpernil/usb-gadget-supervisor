@@ -2,6 +2,8 @@
 Description=USB gadget profile %i
 Documentation=https://github.com/qpernil/usb-gadget-supervisor
 After=local-fs.target
+StartLimitIntervalSec=60s
+StartLimitBurst=5
 
 [Service]
 Type=simple

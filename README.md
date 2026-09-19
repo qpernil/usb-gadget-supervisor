@@ -159,6 +159,11 @@ sudo systemctl link \
 sudo systemctl daemon-reload
 ```
 
+The template retries a failed profile up to five times within one minute. A
+persistent startup error then leaves the unit failed instead of creating an
+unbounded restart loop. After correcting the cause, restart the unit normally;
+use `systemctl reset-failed` first if systemd still reports the start limit.
+
 This is the only special installation directory. The systemd link under
 `/etc/systemd/system` contains no second copy. Each device repository builds
 its unprivileged worker in place and installs only its root-owned profile into
