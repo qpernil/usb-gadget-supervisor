@@ -1,7 +1,7 @@
 # USB Gadget Supervisor
 
 [![CI](https://github.com/qpernil/usb-gadget-supervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/qpernil/usb-gadget-supervisor/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
 `usb-gadget-supervisor` is a privilege-separated Linux service for running
@@ -253,4 +253,5 @@ Security-sensitive reports should follow [SECURITY.md](SECURITY.md).
 
 ## License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option.

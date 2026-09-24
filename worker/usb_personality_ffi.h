@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 #ifndef UGSP_USB_PERSONALITY_FFI_H
 #define UGSP_USB_PERSONALITY_FFI_H
