@@ -1,5 +1,8 @@
 //! Shared worker-side model for publishing USB personalities to the supervisor.
 
+mod discovery;
+pub use discovery::{SetupPacket, discover};
+
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, c_char};
 use std::io::{self, Cursor};
@@ -7,16 +10,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 use std::sync::{Condvar, Mutex};
-
-mod discovery;
-pub use discovery::{SetupPacket, discover};
-#[cfg(unix)]
-mod persistence;
-#[cfg(unix)]
-pub use persistence::{
-    MutationReceipt, PersistenceMode, StateLock, StatePersistence, StatePersistenceHandle,
-    replace_file_atomically,
-};
 
 pub const USB_BUS_EVENT_BODY_LENGTH: usize = 9;
 
