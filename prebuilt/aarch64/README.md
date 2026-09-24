@@ -4,7 +4,7 @@ This convenience build supports small ARM64 targets without a Rust toolchain.
 It includes USB and device profile modes, including managed BSC targets. Install it at the same root-owned
 path as a source build, following the repository README.
 
-Built from clean source commit `12e2c30820256c0d6b7bf9a0ecd29f079915743e`
+Built from clean source commit `a3d48f4cb8bff3c706176758fd92283a77be5d02`
 on `ubuntu4`, Ubuntu 26.04.1 LTS ARM64, with Rust/Cargo 1.98.1 and glibc 2.43.
 ELF version inspection shows a maximum requirement of `GLIBC_2.39`, compatible
 with the Raspberry Pi OS Debian 13 targets using glibc 2.41.
