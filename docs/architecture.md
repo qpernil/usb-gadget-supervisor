@@ -188,7 +188,7 @@ hard-coded.
 | --- | --- | --- |
 | Virtual Trezor One | FunctionFS vendor interface | genuine legacy firmware control engine via shared discovery parser |
 | Future Trezor Safe 3 | FunctionFS interfaces | Core firmware adapter via the same parser or a native Rust object |
-| Virtual YubiKey | FunctionFS/HID as selected | native worker object; dynamic management changes can republish it |
+| Virtual YubiKey | FunctionFS composite FIDO HID + CCID | Native worker personality; Management exposes identity and capabilities; the core implements FIDO2, PIV, OpenPGP, YubiHSM Auth, Issuer SD, and shared SCP03/SCP11 secure messaging |
 | Virtual YubiHSM | FunctionFS vendor bulk | native static or constructed object |
 
 ## Trust statement
