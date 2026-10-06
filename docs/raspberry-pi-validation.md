@@ -45,6 +45,37 @@ provisioning and reset workflows.
 For Virtual Trezor, exercise enumeration and wallet commands with `trezorctl`
 and Trezor Suite.
 
+## Worker transport and activity checks
+
+For Virtual YubiKey, exercise consecutive PIV key-generation and certificate
+operations through Yubico Authenticator, including packet-aligned CCID commands.
+The worker uses the CCID header's declared length rather than waiting for an OUT
+ZLP, tolerates an optional OUT ZLP, and terminates packet-aligned IN responses.
+Response writes run independently of command reception. See
+[CCID framing](https://github.com/qpernil/virtual-yubikey/blob/main/docs/usb-gadget-architecture.md#functionfs-implement-a-usb-function-in-userspace).
+Generating a normal PIV key replaces the key alone; provisioning software must
+explicitly replace or delete a previously stored certificate.
+
+For Virtual YubiHSM, use the explicitly selected virtual-device
+[read-only USB Echo matrix](https://github.com/qpernil/pkcs11rs/blob/master/docs/connector.md#usb-echo-qualification)
+to verify packet boundaries, exact-fit caller buffers, and a following command.
+The native YubiHSM transport is not CCID; aligned OUT commands and IN replies
+both carry ZLPs.
+
+Where a display is installed, verify the worker's policy without introducing
+command delays:
+
+| Worker | Activity off gap | Minimum short-command on pulse | Sustained cadence | Background behavior |
+| --- | --- | --- | --- | --- |
+| Virtual YubiKey | 8 ms minimum; elapsed off time counts | 33.5 ms | 67 ms on / 33 ms off | Idle off; touch wait 384 ms on / 384 ms off |
+| Virtual YubiHSM | 20 ms minimum; elapsed off time counts | 33.5 ms | 67 ms on / 33 ms off | Idle 1.5 s on / 1.5 s off; activity recovery starts with the full off phase |
+
+Commands coalesce into the current indication without extending its minimum on
+time or replaying queued pulses. After activity, an 8 ms off boundary precedes
+background recovery. Renderer time counts toward all intervals; a slower display
+limits the visible cadence. These are worker policies; the supervisor only
+supplies display-resource capabilities.
+
 ## Resource boundary
 
 Inspect the worker process and confirm:
