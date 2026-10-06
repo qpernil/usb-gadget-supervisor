@@ -128,7 +128,7 @@ device UI. Those concerns stay in the worker repositories.
 
 ## Build
 
-Rust 1.94 or later is required. The binary is Linux-only, while profile and
+Rust 1.95 or later is required. The binary is Linux-only, while profile and
 wire-format unit tests also run on macOS. Keep
 `usb-gadget-supervisor` and `raspberry-pi-i2c-target` as sibling checkouts; the
 supervisor uses the target repository's lifecycle library through a sibling
