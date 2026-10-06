@@ -67,7 +67,7 @@ command delays:
 
 | Worker | Activity off gap | Minimum short-command on pulse | Sustained cadence | Background behavior |
 | --- | --- | --- | --- | --- |
-| Virtual YubiKey | 8 ms minimum; elapsed off time counts | 33.5 ms | 67 ms on / 33 ms off | Idle off; touch wait 384 ms on / 384 ms off |
+| Virtual YubiKey | 20 ms minimum; elapsed off time counts | 33.5 ms | 67 ms on / 33 ms off | Idle off; touch wait 384 ms on / 384 ms off |
 | Virtual YubiHSM | 20 ms minimum; elapsed off time counts | 33.5 ms | 67 ms on / 33 ms off | Idle 1.5 s on / 1.5 s off; activity recovery starts with the full off phase |
 
 Commands coalesce into the current indication without extending its minimum on
