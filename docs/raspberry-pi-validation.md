@@ -32,13 +32,16 @@ mount | grep ffs-virtual-yubikey
 
 With a data-capable cable attached, the selected UDC should reach
 `configured`. For Virtual YubiKey, confirm full-speed `1050:0406`, product
-`Virtual Yubico YubiKey FIDO+CCID`, no USB serial string, FIDO HID as
+`YubiKey Gadget FIDO+CCID`, no USB serial string, FIDO HID as
 interface 0, and CCID as interface 1.
 Capture `lsusb -v` and verify the device, configuration, interface, endpoint,
 CCID, and HID descriptors against the worker's accepted CBOR personality in
 `/run/usb-gadget-supervisor`.
 
-Exercise host-level FIDO registration/assertion, Management, and PIV operations.
+Exercise host-level FIDO registration/assertion and CCID Management, PIV,
+OpenPGP, YubiHSM Auth, and Issuer Security Domain operations, including
+GlobalPlatform secure messaging. Use isolated virtual/test devices for
+provisioning and reset workflows.
 For Virtual Trezor, exercise enumeration and wallet commands with `trezorctl`
 and Trezor Suite.
 
