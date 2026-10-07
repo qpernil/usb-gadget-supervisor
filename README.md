@@ -65,7 +65,7 @@ control/lifecycle events but stays out of the packet path. Typed Microsoft OS
 | Project | Responsibility |
 | --- | --- |
 | `usb-gadget-supervisor` | CBOR USB schema/discovery helper, ConfigFS, FunctionFS, typed local-resource ownership, privilege dropping, bind/unbind/reconfiguration, cleanup |
-| [`virtual-yubikey`](https://github.com/qpernil/virtual-yubikey) | Native YubiKey personality publisher, FIDO HID, CCID, Management, FIDO2, PIV, OpenPGP, YubiHSM Auth, Issuer Security Domain, shared SCP03/SCP11 secure messaging, display, touch, and shared applet storage |
+| [`virtual-yubikey`](https://github.com/qpernil/virtual-yubikey) | Native YubiKey personality publisher, FIDO HID, CCID, Management, U2F/FIDO2, PIV, OpenPGP, YubiHSM Auth, Issuer Security Domain, shared SCP03/SCP11 secure messaging, display, touch, and shared applet storage |
 | `virtual-trezor` | Upstream firmware build and descriptor discovery, Pi HAL, OLED/buttons, state |
 | `virtual-yubihsm` | YubiHSM protocol, sessions, objects, capabilities, audit, state |
 

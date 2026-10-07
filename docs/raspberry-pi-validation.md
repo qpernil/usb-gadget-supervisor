@@ -67,7 +67,7 @@ command delays:
 
 | Worker | Activity off gap | Minimum short-command on pulse | Sustained cadence | Background behavior |
 | --- | --- | --- | --- | --- |
-| Virtual YubiKey | 20 ms minimum; elapsed off time counts | 33.5 ms | 67 ms on / 33 ms off | Idle off; touch wait 384 ms on / 384 ms off |
+| Virtual YubiKey | 20 ms minimum; elapsed off time counts | 33.5 ms | 67 ms on / 33 ms off | Idle off; blocking touch waits and U2F polling use 384 ms on / 384 ms off |
 | Virtual YubiHSM | 20 ms minimum; elapsed off time counts | 33.5 ms | 67 ms on / 33 ms off | Idle 1.5 s on / 1.5 s off; activity recovery starts with the full off phase |
 
 Commands coalesce into the current indication without extending its minimum on
@@ -75,6 +75,13 @@ time or replaying queued pulses. After activity, an 8 ms off boundary precedes
 background recovery. Renderer time counts toward all intervals; a slower display
 limits the visible cadence. These are worker policies; the supervisor only
 supplies display-resource capabilities.
+
+For Virtual YubiKey, repeat the [browser FIDO checks](https://github.com/qpernil/virtual-yubikey/blob/main/docs/fido-browser-test.md)
+with U2F and FIDO2 enabled separately. U2F samples the button once per eligible
+poll and returns immediately; its blink phase survives retries and ends on a
+successful presence-authorized operation or 768 ms without another poll. FIDO2
+waits at most 30 seconds for touch, and HID cancellation ends that wait. Command
+activity must not interrupt either presence indication.
 
 ## Resource boundary
 
@@ -143,7 +150,7 @@ It checks inherited FD 3, non-root credentials with no supplementary groups,
 symlink rejection, worker failure, graceful stop, and supervisor parent death.
 
 The hardware launch path is also exercised with `virtual-yubihsm-i2c` on two
-Pi 3B+ targets. Each worker runs as `per` and continues serving through FD 3
+Pi 3B targets, `raspberrypi-1` and `raspberrypi-2` (1 GiB RAM each). Each worker runs as `per` and continues serving through FD 3
 while `/dev/bsc-target0` is root-owned mode `0600`. SIGHUP stops the worker, unloads the BSC resource, reloads the profile, and
 starts its replacement. Stopping the supervisor stops the worker and closes FD
 3 before unloading the module and overlay. Protocol qualification is documented
