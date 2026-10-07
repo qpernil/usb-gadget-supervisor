@@ -150,7 +150,7 @@ It checks inherited FD 3, non-root credentials with no supplementary groups,
 symlink rejection, worker failure, graceful stop, and supervisor parent death.
 
 The hardware launch path is also exercised with `virtual-yubihsm-i2c` on two
-Pi 3B targets, `raspberrypi-1` and `raspberrypi-2` (1 GiB RAM each). Each worker runs as `per` and continues serving through FD 3
+Pi 3B+ targets, `raspberrypi-1` and `raspberrypi-2` (1 GiB RAM each). Each worker runs as `per` and continues serving through FD 3
 while `/dev/bsc-target0` is root-owned mode `0600`. SIGHUP stops the worker, unloads the BSC resource, reloads the profile, and
 starts its replacement. Stopping the supervisor stops the worker and closes FD
 3 before unloading the module and overlay. Protocol qualification is documented
