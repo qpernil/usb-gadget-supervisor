@@ -1,5 +1,7 @@
 # USB Gadget Supervisor
 
+Hostnames and device/account identifiers below are illustrative; replace them with your own configured values.
+
 [![CI](https://github.com/qpernil/usb-gadget-supervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/qpernil/usb-gadget-supervisor/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
@@ -139,9 +141,11 @@ cargo build --release --locked
 cargo test --locked
 ```
 
-Small ARM64 targets may use the checksummed convenience binary in
-[`prebuilt/aarch64/`](prebuilt/aarch64/README.md), substituting that directory
-for `target/release/` below.
+Only the memory-constrained lab hosts `i2c-target-1` and `i2c-target-2` use
+the checksummed binary in [`prebuilt/aarch64/`](prebuilt/aarch64/README.md),
+substituting that directory for `target/release/` below. Build that artifact on
+`build-host` and publish it through the canonical Mac repository. Every other lab
+host builds locally and installs its own `target/release/usb-gadget-supervisor`.
 
 Install the privileged boundary in one root-owned directory:
 

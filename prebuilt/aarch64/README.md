@@ -2,7 +2,8 @@
 
 Hostnames and device/account identifiers below are illustrative; replace them with your own configured values.
 
-This release build supports small ARM64 targets without a Rust toolchain. It
+This release build is retained only for `i2c-target-1` and `i2c-target-2`.
+Every other lab host builds and installs the supervisor locally. It
 includes USB and device profile modes, including managed BSC targets. Install
 it at the root-owned path described in the repository README.
 
