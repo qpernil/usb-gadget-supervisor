@@ -6,11 +6,17 @@ This release build supports small ARM64 targets without a Rust toolchain. It
 includes USB and device profile modes, including managed BSC targets. Install
 it at the root-owned path described in the repository README.
 
-Built from clean source commit `3ab6ace30d0ec266a0f6459f0b1df194f55e535a` on
-`build-host`, Ubuntu 26.04.1 LTS ARM64, with Rust/Cargo 1.98.1 and glibc 2.43.
-The `raspberry-pi-i2c-target` path dependency was at
-`925d083e4969d4f19acf79fc3cdb13fda4cab512`. ELF inspection shows a maximum requirement
-of `GLIBC_2.39`, compatible with Raspberry Pi OS Debian 13 using glibc 2.41.
+Built on `build-host`, Ubuntu 26.04.1 LTS ARM64, with Rust 1.99.1, Cargo 1.99.1,
+and glibc 2.43, from these clean source revisions:
+
+| Build input | Commit |
+| --- | --- |
+| `usb-gadget-supervisor` | `7562838fe10f60b1faa2715f76ca81308db67405` |
+| `raspberry-pi-i2c-target` | `5c8939fdf0e594ba0b782e17ec22d729dfc2040d` |
+
+The source commit's `Cargo.lock` includes libc 0.2.191. ELF inspection shows
+a maximum requirement of `GLIBC_2.39`, compatible with Raspberry Pi OS Debian 13
+using glibc 2.41.
 
 Verify before installation:
 
