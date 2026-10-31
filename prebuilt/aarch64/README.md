@@ -1,6 +1,7 @@
 # ARM64 supervisor binary
 
-This release build supports small ARM64 targets without a Rust toolchain. It
+This release build is retained only for `raspberrypi-1` and `raspberrypi-2`.
+Every other lab host builds and installs the supervisor locally. It
 includes USB and device profile modes, including managed BSC targets. Install
 it at the root-owned path described in the repository README.
 
