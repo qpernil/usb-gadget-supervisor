@@ -17,7 +17,7 @@ resolver = "2"
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "0.9.12"
-libc = "0.2.189"
+libc = "0.2.191"
 usb-gadget-worker = { path = "crates/usb-gadget-worker" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
