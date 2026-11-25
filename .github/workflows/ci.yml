@@ -9,7 +9,11 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: -D warnings
 
@@ -21,6 +25,10 @@ jobs:
         with:
           repository: qpernil/raspberry-pi-i2c-target
           path: raspberry-pi-i2c-target
+      - uses: actions/checkout@v7
+        with:
+          repository: qpernil/display-backends
+          path: display-backends
       - name: Install Rust components
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - name: Select Rust stable
@@ -29,15 +37,16 @@ jobs:
         run: cargo fmt --check
         working-directory: usb-gadget-supervisor
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
         working-directory: usb-gadget-supervisor
       - name: Device profile launch boundary
+        if: runner.os == 'Linux'
         run: |
           cargo build --locked
           sudo python3 tests/device_mode.py "$PWD/target/debug/usb-gadget-supervisor"
         working-directory: usb-gadget-supervisor
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
         working-directory: usb-gadget-supervisor
 
   msrv:
@@ -51,6 +60,10 @@ jobs:
         with:
           repository: qpernil/raspberry-pi-i2c-target
           path: raspberry-pi-i2c-target
+      - uses: actions/checkout@v7
+        with:
+          repository: qpernil/display-backends
+          path: display-backends
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@1.95.0
       - name: Check minimum supported Rust version

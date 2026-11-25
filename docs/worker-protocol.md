@@ -1,5 +1,12 @@
 # Worker protocol
 
+The reusable process harness uses this same contract and control codec. It
+supplies simulated Unix datagram endpoint/resource handles instead of device
+files, with no worker-mode flag. Its macOS control channel uses Unix datagrams
+because macOS lacks Unix `SOCK_SEQPACKET`; record framing and FD transfer remain
+the same. See [worker harness](worker-harness.md) for the I/O compatibility
+boundary and validation limits.
+
 ## Transport
 
 The supervisor creates an `AF_UNIX` `SOCK_SEQPACKET` pair and duplicates the

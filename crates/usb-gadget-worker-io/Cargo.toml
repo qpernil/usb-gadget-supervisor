@@ -1,0 +1,15 @@
+[package]
+name = "usb-gadget-worker-io"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Compatible file, GPIO and display APIs for physical and simulated worker handles"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+display-backends = { path = "../../../display-backends" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpiocdev-uapi = "0.7.0"

@@ -1,5 +1,7 @@
 //! Shared worker-side model for publishing USB personalities to the supervisor.
 
+#[cfg(unix)]
+pub mod control;
 mod discovery;
 pub use discovery::{SetupPacket, discover};
 

@@ -62,6 +62,22 @@ opened FunctionFS data endpoints directly to the worker. It forwards
 control/lifecycle events but stays out of the packet path. Typed Microsoft OS
 1.0/WinUSB and WebUSB declarations travel in the same object.
 
+## Worker process tests
+
+The separate [`usb-gadget-harness`](crates/usb-gadget-harness) crate launches
+real worker executables on macOS and Linux with the normal FD 3 control channel,
+named initial resources, and fresh endpoint handles. It is a test provider;
+the privileged supervisor and physical USB gadget setup remain Linux-only.
+The harness contains no device protocol implementation. Device repositories
+own their request/response scenarios and run them in both operating systems' CI.
+
+Workers use the same command and control protocol with either provider.
+Shared I/O adapters distinguish device files from Unix datagram handles;
+no special worker mode or authentication bypass is required. Embedded devices
+continue to use their cores directly.
+
+See [the harness API and limits](docs/worker-harness.md).
+
 ## Project boundaries
 
 | Project | Responsibility |
@@ -131,14 +147,16 @@ device UI. Those concerns stay in the worker repositories.
 ## Build
 
 Rust 1.95 or later is required. The binary is Linux-only, while profile and
-wire-format unit tests also run on macOS. Keep
-`usb-gadget-supervisor` and `raspberry-pi-i2c-target` as sibling checkouts; the
+wire-format tests, the separate worker I/O compatibility library, and the separate
+`usb-gadget-harness` crate also run on macOS. Keep
+`usb-gadget-supervisor`, `raspberry-pi-i2c-target`, and `display-backends`
+as sibling checkouts; the
 supervisor uses the target repository's lifecycle library through a sibling
 path dependency:
 
 ```sh
 cargo build --release --locked
-cargo test --locked
+cargo test --locked --workspace
 ```
 
 Only the memory-constrained lab hosts `i2c-target-1` and `i2c-target-2` use

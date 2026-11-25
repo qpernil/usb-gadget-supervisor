@@ -21,6 +21,17 @@ The supervisor owns the FunctionFS mount and `ep0`. It translates `ep0` events
 to typed control/lifecycle records and passes the opened data-endpoint files to
 the worker. It never reads or writes device-protocol payloads.
 
+## Portable worker tests
+
+The separate `usb-gadget-harness` crate is an unprivileged test provider on
+macOS and Linux. It launches real workers, exchanges the same control messages,
+and supplies socket-backed resource and endpoint handles. Shared worker I/O
+adapters preserve the hardware-facing API while translating the supplied handle
+semantics. Device protocol logic remains in workers and cores; device-specific
+scenarios remain in their repositories. The Linux supervisor's privilege and
+profile boundaries are unchanged. Embedded integrations call cores directly.
+See [worker harness](worker-harness.md) for details and limits.
+
 ## Ownership
 
 | Resource or decision | Owner |

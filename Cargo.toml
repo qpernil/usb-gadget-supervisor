@@ -11,7 +11,7 @@ categories = ["hardware-support", "command-line-utilities"]
 publish = false
 
 [workspace]
-members = ["crates/usb-gadget-worker"]
+members = ["crates/usb-gadget-worker", "crates/usb-gadget-harness", "crates/usb-gadget-worker-io"]
 resolver = "2"
 
 [dependencies]
