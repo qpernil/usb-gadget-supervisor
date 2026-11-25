@@ -7,6 +7,10 @@ description = "Compatible file, GPIO and display APIs for physical and simulated
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+# Select fake APIs at build time on Linux; macOS always uses compatible APIs.
+simulated = []
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 display-backends = { path = "../../../display-backends" }

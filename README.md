@@ -72,9 +72,10 @@ The harness contains no device protocol implementation. Device repositories
 own their request/response scenarios and run them in both operating systems' CI.
 
 Workers use the same command and control protocol with either provider.
-Shared I/O adapters distinguish device files from Unix datagram handles;
-no special worker mode or authentication bypass is required. Embedded devices
-continue to use their cores directly.
+Production Linux links the real I/O APIs. A build feature selects compatible
+fake APIs for Linux process tests; macOS uses those compatible APIs. There is
+no runtime backend selection, worker-mode flag, or authentication bypass.
+Embedded devices continue to use their cores directly.
 
 See [the harness API and limits](docs/worker-harness.md).
 

@@ -34,10 +34,14 @@ are unchanged. Received descriptors are close-on-exec and owned on error paths.
 
 `usb-gadget-worker-io` provides compatible file, GPIO and display APIs. Worker
 call sites and protocol/lifecycle flow remain intact; platform gates, imports,
-and dependencies select the portable implementation:
+and dependencies select the portable implementation. Production Linux links
+the real APIs directly. The device repositories' `worker-harness` build feature
+selects fake implementations on Linux; macOS uses the compatible APIs.
+There is no runtime backend selection:
 
-- Physical device files retain their Linux operations. Unix datagram resource
-  handles select simulated operations; other socket kinds are rejected.
+- Real Linux APIs and fake APIs are separate build-selected implementations.
+  The fake file/GPIO APIs consume the harness handle protocol; display calls
+  have inert compatible implementations.
 - Simulated handles carry a kind declaration. Endpoint records contain tagged
   opaque transfers or enable/disable events. Empty data represents a USB ZLP;
   partial file reads retain the rest of a transfer. Transfers are bounded to
@@ -47,10 +51,11 @@ and dependencies select the portable implementation:
   explicit level. The adapter exposes the GPIO edge layout and shared current
   level to the existing button loop. Touch authorization still follows the real
   worker's presence policy; the harness never grants it automatically.
-- Display socket handles select an inert renderer. The worker's indicator and
-  presence scheduling still runs; Linux SPI/I2C/GPIO rendering uses device files.
+- Fake display APIs provide an inert renderer. The worker's indicator and
+  presence scheduling still runs; production Linux uses the real display APIs.
 
-Both platforms run the ordinary worker executable without a harness flag.
+Deployment builds omit `worker-harness`; `--all-features` includes the fake APIs.
+Both platforms run the ordinary worker executable without a runtime harness flag.
 The source changes in workers are platform gates, imports, and dependencies;
 existing file/GPIO/display calls, protocol handlers, and lifecycle flow are shared
 with production. Direct embedded core APIs are unchanged and do not depend on
@@ -68,7 +73,7 @@ With sibling checkouts of the first-party dependencies, run the device scenarios
 from each device repository:
 
 ```sh
-cargo test --locked --test worker_harness
+cargo test --locked --features worker-harness --test worker_harness
 ```
 
 The virtual YubiKey tests exercise HID framing, U2F/CTAP, CCID/APDU routing,

@@ -26,9 +26,9 @@ the worker. It never reads or writes device-protocol payloads.
 The separate `usb-gadget-harness` crate is an unprivileged test provider on
 macOS and Linux. It launches real workers, exchanges the same control messages,
 and supplies socket-backed resource and endpoint handles. Shared worker I/O
-adapters preserve the hardware-facing API while translating the supplied handle
-semantics. Device protocol logic remains in workers and cores; device-specific
-scenarios remain in their repositories. The Linux supervisor's privilege and
+APIs preserve worker calls. Linux production builds link the real implementations;
+harness builds link compatible fake implementations, without runtime selection.
+Device protocol logic remains in workers and cores; device-specific scenarios remain in their repositories. The Linux supervisor's privilege and
 profile boundaries are unchanged. Embedded integrations call cores directly.
 See [worker harness](worker-harness.md) for details and limits.
 
